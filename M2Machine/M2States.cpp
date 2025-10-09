@@ -1,0 +1,978 @@
+#include <chrono>
+#include <spdlog/spdlog.h>
+#include "M2States.h"
+#include "M2Machine.h"
+#include <cmath>
+#include <algorithm>
+#include <sstream>
+
+// Provide system_time_sec() locally
+static inline double system_time_sec() {
+    using namespace std::chrono;
+    return duration_cast<duration<double>>(system_clock::now().time_since_epoch()).count();
+}
+
+// --- M2ProbMoveState::sendUI_ implementation (after class declaration) ---
+void M2ProbMoveState::sendUI_(const std::string& msg) {
+    const int seq = ++this->txSeq_;
+    const size_t L = msg.size();
+    if (isPrintableAscii(msg)) {
+        spdlog::info("[TX seq={}] [len={}] {}", seq, L, msg);
+    } else {
+        spdlog::warn("[TX seq={}] [len={}] (non-printable)", seq, L);
+        spdlog::warn("[TX seq={}] HEX: {}", seq, hexDump(msg));
+    }
+    if (machine && machine->UIserver) {
+        machine->UIserver->sendCmd(msg);
+    } else {
+        spdlog::error("[TX seq={}] sendCmd skipped (UIserver null)", seq);
+    }
+}
+static inline double MinJerk(const VM2& X0, const VM2& Xf, double T, double t,
+                             VM2& Xd, VM2& dXd, VM2* ddXd=nullptr){
+    if (T <= 0) { 
+        Xd = Xf; 
+        dXd.setZero(); 
+        if (ddXd) 
+            ddXd->setZero(); 
+        return 1.0; 
+    }
+    if (t < 0) 
+        t = 0; 
+    else if (t > T) 
+        t = T;
+
+    const double s = t / T;
+    const double s2 = s*s, s3 = s2*s, s4 = s3*s, s5 = s4*s;
+    const VM2 dX = (Xf - X0);
+
+    // position
+    Xd  = X0 + dX * (10*s3 - 15*s4 + 6*s5);
+    // velocity
+    dXd = dX * ((30*s2 - 60*s3 + 30*s4) / T);
+    // acceleration (optional)
+    if (ddXd) *ddXd = dX * ((60*s - 180*s2 + 120*s3) / (T*T));
+
+    return s;
+}
+
+double timeval_to_sec(struct timespec *ts)
+{
+    return (double)(ts->tv_sec + ts->tv_nsec / 1000000000.0);
+}
+
+template <typename T>
+static inline T clamp_compat(T v, T lo, T hi) {
+    return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+
+void M2CalibState::entryCode(void) {
+    calibDone=false;
+    for(unsigned int i=0; i<2; i++) {
+        stop_reached_time[i] = .0;
+        at_stop[i] = false;
+    }
+    robot->decalibrate();
+    robot->initTorqueControl();
+    robot->printJointStatus();
+    std::cout << "Calibrating (keep clear)..." << std::flush;
+}
+void M2CalibState::duringCode(void) {
+    VM2 tau(0, 0);
+    VM2 vel=robot->getVelocity();
+    double b = 3;
+    for(unsigned int i=0; i<vel.size(); i++) {
+        tau(i) = -std::min(std::max(20 - b * vel(i), .0), 20.);
+        if(stop_reached_time(i)>1) {
+            at_stop[i]=true;
+        }
+        if(std::abs(vel(i))<0.005) {
+            stop_reached_time(i) += dt();
+        }
+    }
+    if(robot->isCalibrated()) {
+        robot->setEndEffForceWithCompensation(VM2::Zero(), false);
+        calibDone=true;
+    }
+    else {
+        if(at_stop[0] && at_stop[1]) {
+            robot->applyCalibration();
+            std::cout << "OK." << std::endl;
+        }
+        else {
+            robot->setJointTorque(tau);
+            if(iterations()%100==1) {
+                std::cout << "." << std::flush;
+            }
+        }
+    }
+}
+void M2CalibState::exitCode(void) {
+    robot->setEndEffForceWithCompensation(VM2::Zero());
+}
+void M2StandbyState::entryCode() {
+    robot->initTorqueControl();
+    openStandbyCSV_();
+    standbyIter_ = 0;
+}
+void M2StandbyState::duringCode() {
+    // Commanded force in Standby is zero (pure transparent/compensated mode)
+    VM2 F_cmd = VM2::Zero();
+
+    // Apply the commanded force
+    robot->setEndEffForceWithCompensation(F_cmd, true);
+
+    // Snapshot kinematics
+    VM2 X  = robot->getEndEffPosition();
+    VM2 dX = robot->getEndEffVelocity();
+
+    VM2 Fs = robot->getEndEffForce();
+    // Periodic status print
+    if (iterations()%200==1) 
+        robot->printStatus();
+
+    // Lightweight logging every N iterations
+    if (standbyRecording_ && (++standbyIter_ % standbyLogEveryN_ == 0)) {
+        const double sys_t = system_time_sec();
+        const std::string sid = (machine ? machine->sessionId : std::string("UNSET"));
+        writeStandbyCSV_(running(), sys_t, sid, X, dX, F_cmd, Fs);
+    }
+}
+void M2StandbyState::exitCode() {
+    robot->setEndEffForceWithCompensation(VM2::Zero());
+    closeStandbyCSV_();
+}
+
+void M2StandbyState::openStandbyCSV_() {
+    // Append mode to keep a continuous session log
+    standbyCsv_.open("logs/StandbyLog.csv", std::ios::out | std::ios::app);
+    if (standbyCsv_.tellp() == 0) {
+        standbyCsv_ << "time,sys_time,session_id,pos_x,pos_y,vel_x,vel_y,fcmd_x,fcmd_y,fs_x,fs_y\n";
+    }
+}
+
+void M2StandbyState::closeStandbyCSV_() {
+    if (standbyCsv_.is_open()) standbyCsv_.close();
+}
+
+void M2StandbyState::writeStandbyCSV_(double t, double sys_t, const std::string& sid,
+                                      const VM2& pos, const VM2& vel, const VM2& fcmd, const VM2& fsense) {
+    if (!standbyCsv_.is_open()) return;
+    standbyCsv_ << std::fixed << std::setprecision(6)
+                << t << "," << sys_t << "," << sid << ","
+                << pos(0) << "," << pos(1) << ","
+                << vel(0) << "," << vel(1) << ","
+                << fcmd(0) << "," << fcmd(1) << ","
+                << fsense(0) << "," << fsense(1) << "\n";
+}
+
+
+
+
+
+M2ProbMoveState::M2ProbMoveState(RobotM2* M2, M2Machine* mach, const char* name)
+    : M2TimedState(M2, name), machine(mach) {}
+
+void M2ProbMoveState::entryCode() {
+    robot->initTorqueControl();
+    robot->setEndEffForceWithCompensation(VM2::Zero(), false);
+    finishedFlag = false;
+    rng.seed(std::random_device{}());
+    openCSV();
+
+    if (meta_scoreMode == 2) {
+        currentMode = V2_EFFORT_DISTANCE;
+    } else {
+        currentMode = V1_COUNT_SUCCESS;
+    }
+    successfulTrials = 0;
+    totalTrialsV1 = 0;
+    totalScoreV2 = 0.0;
+    totalTrialsV2 = 0;
+
+    currentPhase = TO_A;
+    initToA = true;
+    initTrial = true;
+    pendingStart  = false;
+    betweenTrials = false;
+    lastStrtTime  = -1.0;  // reset debounce timer
+
+    perturbIndex = 0;
+    injectingUp = false;
+    injectingLeft = false;
+    inBandSince = 0.0;
+
+    // Load perturbation forces from CSV
+    loadPerturbationForces();
+    buildDeterministicSchedule();
+}
+
+void M2ProbMoveState::duringCode() {
+
+    // === GLOBAL COMMAND DRAIN ===
+    
+    {
+        int guard = 16;
+        while (guard-- > 0 && machine && machine->UIserver && machine->UIserver->isCmd()) {
+            std::string c; std::vector<double> a;
+            machine->UIserver->getCmd(c, a);
+            
+            if (machine && machine->UIserver) {
+                machine->UIserver->sendCmd(std::string("ECHO ") + c);
+            }
+            auto trim = [](std::string s){
+                auto notspace = [](int ch){ return !std::isspace(ch); };
+                s.erase(s.begin(), std::find_if(s.begin(), s.end(), notspace));
+                s.erase(std::find_if(s.rbegin(), s.rend(), notspace).base(), s.end());
+                return s;
+            };
+            std::string cu = trim(c);
+            std::transform(cu.begin(), cu.end(), cu.begin(), [](unsigned char ch){ return std::toupper(ch); });
+
+            
+            if (cu.rfind("HALT", 0) == 0) {
+                finishedFlag = true;
+                if (machine && machine->UIserver) machine->UIserver->sendCmd("OK");
+                machine->UIserver->clearCmd();
+                spdlog::info("GLOBAL: HALT -> finishedFlag=1");
+                continue;
+            }
+            
+            if (cu.rfind("RSTA", 0) == 0) {
+                currentPhase   = TO_A;
+                initToA        = true;
+                inBandSince    = 0.0;
+                effortIntegral = 0.0;
+                betweenTrials  = false;
+                if (machine && machine->UIserver) machine->UIserver->sendCmd("OK");
+                machine->UIserver->clearCmd();
+                spdlog::info("GLOBAL: RSTA -> TO_A");
+                continue;
+            }
+            
+            if (cu.rfind("S_PB", 0) == 0 && !a.empty()) {
+                probLeft = clamp_compat(a[0], 0.0, 1.0);
+                buildDeterministicSchedule();
+                if (machine && machine->UIserver) machine->UIserver->sendCmd("OK");
+                machine->UIserver->clearCmd();
+                spdlog::info("GLOBAL: S_PB applied -> pLeft={:.3f}", probLeft);
+                continue;
+            }
+            
+            if (cu.rfind("STRT", 0) == 0) {
+                double now = running();
+                if (pendingStart) {
+                    spdlog::warn("STRT ignored: already pending (phase={}, Δt={:.3f}s)", (int)currentPhase, (now - lastStrtTime));
+                    machine->UIserver->clearCmd();
+                    continue; 
+                }
+                if (lastStrtTime >= 0.0 && (now - lastStrtTime) < strtMinInterval) {
+                    spdlog::warn("STRT ignored due to debounce (Δt={:.3f}s < {:.3f}s)", (now - lastStrtTime), strtMinInterval);
+                    machine->UIserver->clearCmd();
+                    continue; 
+                }
+                pendingStart = true;
+                lastStrtTime = now;
+                machine->UIserver->clearCmd();
+                spdlog::info("GLOBAL: STRT captured (pendingStart=1, t={:.3f})", now);
+                break; 
+            }
+            
+            if (cu.rfind("S_MD",0)==0 || cu.rfind("S_MT",0)==0 || cu.rfind("S_TS",0)==0) {
+                if (betweenTrials) {
+                    if (cu.rfind("S_MD",0)==0 && !a.empty()) {
+                        meta_scoreMode = (int)std::round(a[0]);
+                        // Immediately apply to the runtime scoring mode so UI and scoring stay consistent
+                        currentMode = (meta_scoreMode == 2) ? V2_EFFORT_DISTANCE : V1_COUNT_SUCCESS;
+                        spdlog::info("BETWEEN-TRIALS: S_MD -> mode={} (currentMode now = {})",
+                                     meta_scoreMode, (currentMode == V2_EFFORT_DISTANCE ? 2 : 1));
+                        if (machine && machine->UIserver) machine->UIserver->sendCmd("OK");
+                    } else if (cu.rfind("S_MT",0)==0 && !a.empty()) {
+                        meta_maxTrials = std::max(1, (int)std::round(a[0]));
+                        spdlog::info("BETWEEN-TRIALS: S_MT -> maxTrials={}", meta_maxTrials);
+                        if (machine && machine->UIserver) machine->UIserver->sendCmd("OK");
+                    } else if (cu.rfind("S_TS",0)==0 && !a.empty()) {
+                        meta_targetSucc = std::max(1, (int)std::round(a[0]));
+                        spdlog::info("BETWEEN-TRIALS: S_TS -> targetSucc={}", meta_targetSucc);
+                        if (machine && machine->UIserver) machine->UIserver->sendCmd("OK");
+                    } else {
+                        if (machine && machine->UIserver) machine->UIserver->sendCmd("ERR ARG");
+                    }
+                } else {
+                    if (machine && machine->UIserver) machine->UIserver->sendCmd("BUSY");
+                    spdlog::warn("PARAM LOCKED: '{}' rejected (phase={}, betweenTrials=0)", cu, (int)currentPhase);
+                }
+                machine->UIserver->clearCmd();
+                continue;
+            }
+            if (cu.rfind("S_SID", 0) == 0 && !a.empty()) {
+                long long sidNum = (long long)std::llround(a[0]);
+                if (machine) machine->sessionId = std::to_string(sidNum);
+                if (machine && machine->UIserver) machine->UIserver->sendCmd("OK");
+                machine->UIserver->clearCmd();
+                spdlog::info("GLOBAL: S_SID -> sessionId={}", (machine ? machine->sessionId : std::string("null")));
+                continue;
+            }
+
+            
+            spdlog::warn("GLOBAL: unknown cmd='{}' (trim='{}') @phase={}", c, cu, (int)currentPhase);
+            machine->UIserver->clearCmd();
+        }
+    }
+    // === END GLOBAL COMMAND DRAIN ===
+    // The main switch statement to manage internal phases
+    switch (currentPhase) {
+        case TO_A: {
+            // This block simulates M2ToAState
+            if (initToA) {
+                // Simulate entryCode() for TO_A
+                resetToAPlan(robot->getEndEffPosition());
+                resetToAIntegrators();
+                initToA = false;
+            }
+
+            VM2 X = robot->getEndEffPosition();
+            VM2 dX = robot->getEndEffVelocity();
+            VM2 F_cmd = VM2::Zero();
+
+            VM2 Xd, dXd;
+            MinJerk(Xi, A, T_toA, running() - t0_toA, Xd, dXd);
+
+            double k_pos = 4.0;
+            F_cmd = impedance(Xd, X, dX, dXd) + k_pos * (Xd - X);
+
+            if (enablePIDToA) {
+                VM2 e = (Xd - X);
+                VM2 de = (dXd - dX);
+                iErrToA += e * dt();
+                for (int i = 0; i < 2; i++) {
+                    double lim = (iToA_max > 1e-9 ? (iToA_max / std::max(1e-9, KiToA)) : 0.0);
+                    iErrToA(i) = clamp_compat(iErrToA(i), -lim, +lim);
+                }
+                VM2 F_pid = KpToA * e + KiToA * iErrToA + KdToA * de;
+                F_cmd += F_pid;
+            }
+
+            applyForce(F_cmd);
+
+            // Transition condition check
+            double distA = (A - X).norm();
+            bool atA = false;
+            if (distA < epsA_hold) {
+                if (inBandSince == 0.0) {
+                    inBandSince = running();
+                } else if (running() - inBandSince >= holdTimeA) {
+                    atA = true;
+                }
+            } else {
+                inBandSince = 0.0;
+            }
+
+            if (atA) {
+                currentPhase = WAIT_START;
+                betweenTrials = true;                 // 进入两次试次之间，允许改 S_MD/S_MT/S_TS
+                spdlog::info("TO_A -> WAIT_START (betweenTrials=1)");
+            }
+            break;
+        }
+        // In M2States.cpp, inside M2ProbMoveState::duringCode()
+
+        case WAIT_START: {
+            
+            VM2 X = robot->getEndEffPosition();
+            double distToA = (A - X).norm();
+            bool atA_hold = false;
+            if (distToA < epsA_hold) {
+                if (inBandSince == 0.0) inBandSince = running();
+                else if ((running() - inBandSince) >= holdTimeA) atA_hold = true;
+            } else {
+                inBandSince = 0.0;
+            }
+            if (pendingStart && atA_hold) {
+                pendingStart  = false;
+                betweenTrials = false;  
+                currentPhase  = TRIAL;
+                initTrial     = true;
+                if (machine && machine->UIserver) machine->UIserver->sendCmd("OK");
+                spdlog::info("WAIT_START: pendingStart consumed -> TRIAL (atA_hold=1)");
+                break; 
+            } else if (pendingStart && !atA_hold) {
+                
+                if (iterations() % 200 == 1) {
+                    spdlog::info("WAIT_START: STRT pending but not at A (dist={:.3f} <? {:.3f})", distToA, epsA_hold);
+                }
+            }
+
+            
+            if (iterations() % 1000 == 1) {
+                spdlog::info(
+                    "WAIT_START cfg: pLeft={:.3f}, mode={}, targetSucc={}, maxTrials={}, V1={}/{}, V2Score={:.3f}({}), finishedFlag={}",
+                    probLeft, meta_scoreMode, meta_targetSucc, meta_maxTrials,
+                    successfulTrials, totalTrialsV1, totalScoreV2, totalTrialsV2,
+                    finishedFlag ? 1 : 0
+                );
+            }
+            robot->setEndEffForceWithCompensation(VM2::Zero());
+  
+            break;
+        }
+
+        case TRIAL: {
+            // This block simulates M2TrialState
+            if (initTrial) {
+                // Simulate entryCode() for TRIAL
+                trialStartTime = running();
+                decideInternalForceDirection();
+                effortIntegral = 0.0;
+                rawEffortIntegral = 0.0;
+                // 依据注入力方向设定基线冲量（单位 N·s）
+                if (injectingUp)       baselineImpulseN = 32.0;   // 你测得的“向上”基线冲量
+                else if (injectingLeft) baselineImpulseN = 12.0;  // 你测得的“向左”基线冲量
+                else                    baselineImpulseN = 0.0;   // 无注入就不扣
+
+                if (machine && machine->UIserver) {
+                    std::ostringstream oss;
+                    oss.setf(std::ios::fixed);
+                    oss.precision(3);
+                    int curTrialForMode = (currentMode == V1_COUNT_SUCCESS) ? totalTrialsV1 : totalTrialsV2;
+                    oss << "TRIAL_BEGIN t=" << trialStartTime
+                        << " dir=" << (internalForce(0) < -1e-9 ? "LEFT" : (internalForce(1) > 1e-9 ? "UP" : "NONE"))
+                        << " pLeft=" << probLeft
+                        << " mode=" << (currentMode == V1_COUNT_SUCCESS ? 1 : 2)
+                        << " cur_trial=" << curTrialForMode
+                        << " max_trial=" << meta_maxTrials;
+                    std::string outBegin = oss.str();
+                    sendUI_(outBegin);
+                    {
+                        std::vector<double> p;
+                        int dirCode = (internalForce(0) < -1e-9) ? -1 : ((internalForce(1) > 1e-9) ? 1 : 0);
+                        int curTrialForMode = (currentMode == V1_COUNT_SUCCESS) ? totalTrialsV1 : totalTrialsV2;
+                        p.push_back(trialStartTime);                             // t
+                        p.push_back((double)dirCode);                            // dirCode
+                        p.push_back(probLeft);                                   // pLeft
+                        p.push_back((double)(currentMode == V1_COUNT_SUCCESS ? 1 : 2)); // mode
+                        p.push_back((double)curTrialForMode);                    // cur
+                        p.push_back((double)meta_maxTrials);                     // max
+                        machine->UIserver->sendCmd("TRBG", p);
+                    }
+                }
+                spdlog::info(
+                    "TRIAL_BEGIN cfg: pLeft={:.3f}, mode={}, targetSucc={}, maxTrials={}, V1={}/{}, V2Score={:.3f}({})",
+                    probLeft,
+                    meta_scoreMode,
+                    meta_targetSucc,
+                    meta_maxTrials,
+                    successfulTrials,
+                    totalTrialsV1,
+                    totalScoreV2,
+                    totalTrialsV2
+                );
+                initTrial = false;
+            }
+
+            VM2 X = robot->getEndEffPosition();
+            VM2 dX = robot->getEndEffVelocity();
+            VM2 F_damp = -Dv * dX;
+            double n = (C - X).norm();
+            double tTrial = running() - trialStartTime;
+
+            // Guard: do not declare success in the first 80 ms to avoid dur=0 "instant success"
+            const double minTrialEvalTime = 0.08;
+
+            // === Recorded-perturbation replay (frame-by-frame) ===
+            VM2 F_int = VM2::Zero();
+            if (injectingUp) {
+                if (perturbIndex < upPerturbForce.size()) {
+                    F_int(1) = upPerturbForce[perturbIndex++];
+                }
+            } else if (injectingLeft) {
+                if (perturbIndex < leftPerturbForce.size()) {
+                    F_int(0) = leftPerturbForce[perturbIndex++];
+                }
+            }
+
+            VM2 F_cmd = F_int + impedance(robot->getEndEffPosition(), X, dX);
+            applyForce(F_cmd);
+            // --- Effort calculation based on commanded force (Standby-style) ---
+            VM2 F_user = robot->getEndEffForce();  // sensor-measured interaction force
+            const double Fu_norm = F_user.norm();
+
+            // 先累计原始冲量（N·s），再统一扣除方向基线冲量（同为N·s），并截断为非负
+            rawEffortIntegral += Fu_norm * dt();
+            effortIntegral = std::max(0.0, rawEffortIntegral - baselineImpulseN);
+
+            {
+                const double incr = Fu_norm * dt();
+                spdlog::info("[EFFORT] Fs=({:.3f},{:.3f}) |Fs|={:.4f} dt={:.4f} +raw={:.4f} rawTot={:.4f} base={:.3f} humanEff={:.4f}",
+                            F_user(0), F_user(1), Fu_norm, dt(), incr, rawEffortIntegral, baselineImpulseN, effortIntegral);
+            }
+            writeCSV(running(), X, dX, F_int, F_user, effortIntegral);
+
+
+            if (iterations() % 1000 == 1) {
+                spdlog::info(
+                    "TRIAL status: t={:.3f}, n={:.3f}, effort={:.3f}, pLeft={:.3f}, mode={}, targetSucc={}, maxTrials={}",
+                    (running() - trialStartTime),
+                    n,
+                    effortIntegral,
+                    probLeft,
+                    meta_scoreMode,
+                    meta_targetSucc,
+                    meta_maxTrials
+                );
+            }
+
+            // Transition condition check
+            bool reachedC = (n < epsC) && (tTrial >= minTrialEvalTime);
+            bool timeout = (tTrial >= trialMaxTime);
+            if (reachedC || timeout) {
+                // Scoring logic is now handled here directly
+                double trialScore = 0;
+
+                if (currentMode == V1_COUNT_SUCCESS) {
+                    totalTrialsV1++;
+                    if (reachedC) {
+                        successfulTrials++;
+                        trialScore = 1; // V1 score: 1 for success, 0 for fail
+                    }
+                    if (successfulTrials >= meta_targetSucc || totalTrialsV1 >= meta_maxTrials) finishedFlag = true;
+                } else { // V2_EFFORT_DISTANCE
+                    totalTrialsV2++;
+                    const double S_max = 100.0;
+                    // 统一评分：即便超时也按当下距离与累计努力给出分数
+                    // 可选：超时附加罚分（使分数更低）
+                    const double baseScore = S_max - 100 * n - effortIntegral;
+                    const double timeoutPenalty = (!reachedC ? 10.0 : 0.0); // 需要可以调
+                    trialScore = baseScore - timeoutPenalty;
+                    totalScoreV2 += trialScore;
+                    if (totalTrialsV2 >= meta_maxTrials) finishedFlag = true;
+                }
+
+                if (machine && machine->UIserver) {
+                    std::ostringstream oss;
+                    oss.setf(std::ios::fixed);
+                    oss.precision(3);
+                    oss << "TRIAL_END t=" << running() << " dur=" << tTrial
+                        << " reached=" << (reachedC ? 1 : 0)
+                        << " dist=" << n
+                        << " effort=" << effortIntegral
+                        << " trialScore=" << trialScore
+                        << " dir=" << (internalForce(0) < -1e-9 ? "LEFT" : (internalForce(1) > 1e-9 ? "UP" : "NONE"))
+                        << " pLeft=" << probLeft
+                        << " mode=" << (currentMode == V1_COUNT_SUCCESS ? 1 : 2);
+                    int curTrial = (currentMode == V1_COUNT_SUCCESS) ? totalTrialsV1 : totalTrialsV2;
+                    oss << " cur_trial=" << curTrial
+                        << " max_trial=" << meta_maxTrials;
+                    if (currentMode == V1_COUNT_SUCCESS) {
+                        oss << " v1_suc=" << successfulTrials
+                            << " v1_tar=" << meta_targetSucc;
+                    } else {
+                        oss << " v2_sco=" << totalScoreV2;
+                    }
+                    std::string out = oss.str();
+                    sendUI_(out);
+                    {
+                        std::vector<double> p;
+                        int dirCode = (internalForce(0) < -1e-9) ? -1 : ((internalForce(1) > 1e-9) ? 1 : 0);
+                        int curTrial = (currentMode == V1_COUNT_SUCCESS) ? totalTrialsV1 : totalTrialsV2;
+
+                        p.push_back(running());               // t
+                        p.push_back(tTrial);                  // dur
+                        p.push_back(reachedC ? 1.0 : 0.0);   // reached
+                        p.push_back(n);                       // dist
+                        p.push_back(effortIntegral);          // effort
+                        p.push_back(trialScore);              // trialScore
+                        p.push_back((double)(currentMode == V1_COUNT_SUCCESS ? 1 : 2)); // mode
+                        p.push_back((double)curTrial);        // cur
+                        p.push_back((double)meta_maxTrials);  // max
+                        if (currentMode == V1_COUNT_SUCCESS) {
+                            p.push_back((double)successfulTrials); // v1_suc
+                            p.push_back((double)meta_targetSucc);  // v1_tar
+                            p.push_back(0.0);                      // v2_sco placeholder
+                        } else {
+                            p.push_back(0.0);                      // v1_suc placeholder
+                            p.push_back(0.0);                      // v1_tar placeholder
+                            p.push_back(totalScoreV2);             // v2_sco
+                        }
+                        p.push_back((double)dirCode);              // dirCode（可选）
+                        machine->UIserver->sendCmd("TREN", p);
+                    }
+                }
+                if (!finishedFlag) {
+                    // Optionally reset perturbation injection state
+                    injectingUp = false;
+                    injectingLeft = false;
+                    perturbIndex = 0;
+                    // Stay in ProbMove but go back to WAIT_START to await explicit STRT.
+                    currentPhase    = WAIT_START;
+                    betweenTrials   = true;      // allow param changes between trials
+                    initTrial       = true;     // prepare for a fresh TRIAL init when STRT arrives
+                    inBandSince     = 0.0;      // reset hold timer
+                    effortIntegral  = 0.0;      // reset effort accumulator for next trial
+                    spdlog::info("TRIAL: finished (reachedC={}, timeout={}) -> WAIT_START. Awaiting STRT.", reachedC, timeout);
+                    return;                      // important: exit now to avoid any further TRIAL computations this frame
+                }
+
+            }
+            break;
+        }
+    }
+}
+
+void M2ProbMoveState::exitCode() {
+    robot->setEndEffForceWithCompensation(VM2::Zero());
+    if (csv.is_open()) csv.close();
+
+    if (machine && machine->UIserver) {
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss.precision(3);
+        oss << "SESSION_END mode=" << (currentMode == V1_COUNT_SUCCESS ? 1 : 2)
+            << " V1_success=" << successfulTrials << " V1_trials=" << totalTrialsV1
+            << " V2_score=" << totalScoreV2 << " V2_trials=" << totalTrialsV2;
+        std::string out = oss.str();
+        sendUI_(out);// 追加发送 4-char 协议帧：SESS (mode, V1_success, V1_trials, V2_score, V2_trials)
+        {
+            std::vector<double> p;
+            p.push_back((double)(currentMode == V1_COUNT_SUCCESS ? 1 : 2));
+            p.push_back((double)successfulTrials);
+            p.push_back((double)totalTrialsV1);
+            p.push_back(totalScoreV2);
+            p.push_back((double)totalTrialsV2);
+            machine->UIserver->sendCmd("SESS", p);
+        }
+    }
+}
+
+
+
+// ... impedance, readUserForce, etc. methods remain the same ...
+VM2 M2ProbMoveState::impedance(const VM2& X0, const VM2& X, const VM2& dX, const VM2& dXd) {
+    Eigen::Matrix2d K = Eigen::Matrix2d::Identity() * k;
+    Eigen::Matrix2d D = Eigen::Matrix2d::Identity() * d;
+    return K * (X0 - X) + D * (dXd - dX);
+}
+
+VM2 M2ProbMoveState::readUserForce() {
+    VM2 f = VM2::Zero();
+    if (robot->joystick) {
+        const double ax0 = robot->joystick->getAxis(0);
+        const double ax1 = robot->joystick->getAxis(1);
+        f(0) = userForceScale * ax0;
+        f(1) = userForceScale * ax1;
+        spdlog::debug("[EFFORT] readUserForce axes=({:.3f},{:.3f}) scale={} -> F_user=({:.3f},{:.3f})",
+                      ax0, ax1, userForceScale, f(0), f(1));
+    } else {
+        spdlog::warn("[EFFORT] readUserForce: joystick is null; returning (0,0)");
+    }
+    return f;
+}
+/*
+VM2 M2ProbMoveState::readUserForce() {
+    // 首选：真实交互力
+    return robot->getEndEffInteractionForce();
+}
+*/
+void M2ProbMoveState::decideInternalForceDirection() {
+    if (trialSchedule_.empty()) buildDeterministicSchedule();
+    int dirFlag = trialSchedule_[trialIdx_ % trialSchedule_.size()];
+    ++trialIdx_;
+    internalForce = (dirFlag < 0) ? VM2(-robotForceMagLeft, 0.0) : VM2(0.0, +robotForceMagUp);
+    injectingLeft = (internalForce(0) < -1e-9);
+    injectingUp   = (internalForce(1) >  1e-9);
+    perturbIndex  = 0;
+    spdlog::info("TRIAL direction (deterministic): {}", (dirFlag < 0 ? "LEFT" : "UP"));
+}
+
+void M2ProbMoveState::resetToAPlan(const VM2& Xnow) {
+    Xi = Xnow;
+    t0_toA = running();
+    inBandSince = 0.0;
+}
+
+void M2ProbMoveState::resetToAIntegrators() {
+    iErrToA.setZero();
+}
+
+void M2ProbMoveState::buildDeterministicSchedule() {
+    trialSchedule_.clear();
+    // 限定 10%..90%
+    int leftCount = static_cast<int>(std::round(probLeft * 10.0));
+    leftCount = std::max(1, std::min(9, leftCount));
+
+    const int total = 10;
+    trialSchedule_.assign(total, +1); // 默认向上
+    // 把 LEFT 均匀地、确定性地铺在 10 个位置上（固定算法，无随机种子）
+    for (int k = 0; k < leftCount; ++k) {
+        int pos = static_cast<int>(std::floor((k + 0.5) * (double)total / (double)leftCount)) % total;
+        trialSchedule_[pos] = -1;
+    }
+    trialIdx_ = 0;
+
+    spdlog::info("[SCHEDULE] Built deterministic 10-trial schedule (leftCount={})", leftCount);
+}
+
+void M2ProbMoveState::openCSV() {
+    csv.open("logs/M2ProbMoveState.csv", std::ios::out | std::ios::app);
+    if (csv.tellp() == 0) {
+        // MODIFIED: Added effort to CSV header
+        csv << "time,sys_time,session_id,pos_x,pos_y,vel_x,vel_y,internal_fx,internal_fy,user_fx,user_fy,prob_left,score_mode,target_succ,max_trials,effort\n";
+    }
+}
+
+// MODIFIED: Added effort to CSV logging
+void M2ProbMoveState::writeCSV(double t, const VM2& pos, const VM2& vel,
+    const VM2& fInternal, const VM2& fUser, double effort) {
+    if (!csv.is_open()) return;
+    const double sys_t = system_time_sec();
+    const std::string sid = (machine ? machine->sessionId : std::string("UNSET"));
+    csv << std::fixed << std::setprecision(6)
+        << t << "," << sys_t << "," << sid << ","
+        << pos(0) << "," << pos(1) << ","
+        << vel(0) << "," << vel(1) << ","
+        << fInternal(0) << "," << fInternal(1) << ","
+        << fUser(0) << "," << fUser(1) << ","
+        << probLeft << ","
+        << meta_scoreMode << ","
+        << meta_targetSucc << ","
+        << meta_maxTrials << ","
+        << effort << "\n";
+}
+
+void M2ProbMoveState::applyForce(const VM2& F) {
+    VM2 F_clamped = F;
+    for (int i=0; i<2; ++i) {
+        F_clamped(i) = clamp_compat(F_clamped(i), -forceSaturation, forceSaturation);
+    }
+    robot->setEndEffForceWithCompensation(F_clamped, true);
+}
+
+
+// --- CSV perturbation force loading helpers ---
+
+void M2ProbMoveState::loadPerturbationForces() {
+    // Static injection: measured segments hard-coded (frame-by-frame replay)
+    // Upward perturbation (new list)
+    upPerturbForce = {
+        24.887317, 25.231683, 24.887317, 25.576049, 25.920415, 25.920415, 26.264781, 25.920415, 25.576049, 25.920415,
+        25.576049, 25.576049, 25.920415, 25.920415, 25.576049, 25.576049, 26.609147, 25.920415, 25.231683, 25.920415,
+        26.264781, 26.609147, 25.920415, 25.920415, 25.576049, 26.264781, 26.264781, 25.920415, 25.920415, 26.264781,
+        25.920415, 25.920415, 26.609147, 26.609147, 25.920415, 26.264781, 25.576049, 25.576049, 25.576049, 25.231683,
+        26.264781, 25.920415, 25.920415, 25.920415, 25.231683, 25.920415, 25.576049, 25.576049, 25.576049, 25.576049,
+        25.231683, 25.231683, 26.609147, 25.576049, 25.920415, 25.920415, 25.576049, 25.576049, 26.264781, 25.231683,
+        26.609147, 25.576049, 26.264781, 26.609147, 25.920415, 25.920415, 25.576049, 25.920415, 25.920415, 25.920415,
+        25.920415, 26.264781, 25.920415, 25.920415, 25.920415, 25.920415, 26.264781, 26.264781, 25.231683, 25.920415,
+        26.264781, 26.609147, 26.264781, 26.609147, 25.920415, 26.609147, 25.920415, 26.264781, 26.264781, 26.264781,
+        25.920415, 26.264781, 25.920415, 25.576049, 25.576049, 25.576049, 26.264781, 26.264781, 25.576049, 25.920415,
+        26.609147, 26.264781, 25.920415, 25.231683, 26.609147, 25.920415, 26.953512, 25.576049, 26.264781, 26.264781,
+        25.920415, 26.264781, 25.576049, 26.264781, 26.264781, 25.920415, 26.609147, 26.609147, 25.920415, 25.920415,
+        26.953512, 26.264781, 25.920415, 26.264781, 25.576049, 26.609147, 26.264781, 25.920415, 25.920415, 25.576049,
+        26.609147, 26.264781, 26.264781, 26.264781, 26.609147, 26.609147, 26.264781, 26.953512, 26.609147, 25.576049,
+        25.920415, 25.576049, 26.264781, 26.264781, 25.920415, 26.264781, 26.609147, 26.609147, 25.920415, 26.953512,
+        26.609147, 26.609147, 25.231683, 26.953512, 25.920415, 26.264781, 26.609147, 26.264781, 26.953512, 26.264781,
+        26.264781, 26.953512, 25.920415, 25.920415, 26.264781, 25.920415, 26.953512, 25.576049, 26.609147, 25.576049,
+        26.953512, 26.264781, 25.920415, 26.609147, 25.231683, 26.264781, 25.576049, 26.264781, 25.920415, 26.264781,
+        26.953512, 25.920415, 26.264781, 25.920415, 26.264781, 25.231683, 26.609147, 26.264781, 25.920415, 26.953512,
+        26.609147, 27.297878, 26.609147, 26.264781, 26.609147, 26.264781, 26.953512, 26.264781, 26.953512, 25.920415,
+        26.609147, 26.953512, 26.609147, 26.953512, 27.297878, 26.264781, 26.264781, 25.920415, 26.264781, 26.609147,
+        26.953512, 26.953512, 26.953512, 26.609147, 25.576049, 27.297878, 25.920415, 26.609147, 26.264781, 26.264781,
+        26.609147, 26.264781, 26.609147, 26.609147, 26.953512, 25.920415, 25.576049, 26.609147, 26.609147, 26.264781,
+        26.264781, 26.264781, 26.264781, 26.953512, 25.920415, 26.264781, 25.920415, 26.264781, 25.920415, 26.609147,
+        26.264781, 26.609147, 25.920415, 26.953512, 26.953512, 26.953512, 26.264781, 25.920415, 26.609147, 26.609147,
+        25.920415, 25.576049, 26.609147, 26.609147, 25.576049, 27.297878, 25.576049, 26.609147, 26.264781, 26.264781,
+        25.920415, 25.920415, 26.609147, 26.264781, 26.609147, 25.920415, 25.920415, 26.264781, 26.264781, 26.609147,
+        26.953512, 25.920415, 25.920415, 25.920415, 25.920415, 26.609147, 25.576049, 25.920415, 25.920415, 25.920415,
+        26.609147, 25.920415, 26.609147, 26.609147, 26.609147, 26.953512, 25.920415, 25.920415, 26.264781, 26.264781,
+        25.920415, 26.264781, 25.920415, 26.609147, 26.609147, 26.609147, 26.609147, 26.953512, 26.609147, 26.609147,
+        25.576049, 26.609147, 25.920415, 26.609147, 26.609147, 26.264781, 26.264781, 25.576049, 25.920415, 25.920415,
+        25.920415, 26.953512, 26.609147, 26.609147, 26.264781, 25.920415, 26.264781, 25.920415, 26.264781, 26.953512,
+        26.264781, 25.920415, 26.609147, 26.609147, 25.920415, 26.609147, 26.953512, 25.920415, 25.920415, 25.920415,
+        25.920415, 26.609147, 25.920415, 26.264781, 26.264781, 26.264781, 26.609147, 25.920415, 25.920415, 26.264781,
+        26.264781, 26.264781, 25.920415, 26.609147, 26.264781, 26.264781, 26.264781, 26.264781, 26.264781, 26.609147,
+        26.609147, 25.920415, 25.920415, 26.264781, 27.297878, 26.609147, 25.576049, 26.264781, 26.609147, 25.920415,
+        25.576049, 25.920415, 26.609147, 27.297878, 26.609147, 26.264781, 25.920415, 26.609147, 25.576049, 25.920415,
+        25.920415, 25.920415, 25.920415, 25.920415, 26.609147, 25.920415, 25.231683, 26.264781, 25.576049, 25.920415,
+        25.920415, 26.264781, 26.264781, 25.576049, 26.264781, 25.576049, 25.920415, 26.609147, 25.920415, 26.264781,
+        25.576049, 26.264781, 26.609147, 26.264781, 25.576049, 26.264781, 25.920415, 25.920415, 25.920415, 25.576049,
+        25.920415, 25.920415, 26.609147, 25.576049, 26.264781, 25.920415, 26.264781, 25.920415, 25.920415, 26.264781,
+        25.920415, 25.920415, 25.231683, 26.264781, 25.576049, 25.920415, 25.920415, 26.264781, 26.264781, 25.576049,
+        25.576049, 25.576049, 25.920415, 26.264781, 25.231683, 26.609147, 26.609147, 26.264781, 25.920415, 25.920415,
+        26.264781, 26.264781, 26.609147, 25.576049, 25.920415, 25.920415, 26.609147, 26.264781, 25.576049, 25.231683,
+        25.231683, 26.264781, 26.264781, 25.920415, 26.609147, 25.576049, 25.920415, 25.920415, 25.920415, 25.920415,
+        26.264781, 26.264781, 25.576049, 25.920415, 25.576049, 25.231683, 25.920415, 26.264781, 25.920415, 26.953512,
+        26.609147, 25.920415, 25.920415, 26.264781, 26.953512, 26.264781, 26.264781, 26.264781, 25.576049, 26.609147,
+        26.264781, 26.264781, 26.264781, 26.264781, 25.920415, 25.576049, 25.920415, 25.920415, 25.231683, 25.576049,
+        26.264781, 25.231683, 26.609147, 26.264781, 25.920415, 26.264781, 19.033098, 18.688732
+    };
+    leftPerturbForce = {
+        -12.231683, -12.920415, -12.576049, -12.920415, -12.576049, -12.920415, -12.920415, -12.920415, -13.264781, -12.920415,
+        -13.264781, -13.264781, -13.264781, -13.264781, -12.920415, -12.920415, -12.920415, -13.264781, -12.920415, -12.576049,
+        -12.920415, -12.920415, -12.576049, -11.887317, -12.576049, -13.264781, -12.231683, -12.920415, -12.920415, -12.920415,
+        -12.576049, -13.953512, -13.264781, -12.920415, -12.920415, -12.576049, -12.231683, -12.576049, -12.920415, -12.920415,
+        -12.231683, -13.264781, -12.920415, -13.953512, -13.264781, -13.609147, -13.264781, -13.264781, -13.609147, -13.264781,
+        -12.920415, -13.264781, -13.264781, -13.609147, -13.264781, -12.231683, -12.231683, -12.576049, -12.920415, -12.920415,
+        -13.264781, -13.264781, -12.231683, -12.576049, -12.920415, -13.264781, -12.920415, -12.231683, -13.264781, -13.609147,
+        -12.576049, -13.264781, -13.264781, -12.920415, -13.264781, -13.609147, -13.609147, -13.264781, -12.920415, -13.264781,
+        -13.264781, -13.264781, -13.264781, -12.920415, -12.920415, -12.920415, -13.264781, -13.264781, -13.264781, -12.920415,
+        -13.609147, -13.264781, -13.264781, -13.264781, -13.264781, -13.609147, -12.576049, -13.264781, -13.264781, -13.264781,
+        -13.264781, -12.920415, -12.920415, -12.920415, -12.920415, -12.576049, -13.609147, -13.264781, -13.609147, -12.920415,
+        -13.953512, -12.920415, -13.264781, -12.920415, -13.264781, -13.609147, -13.609147, -13.609147, -13.264781, -13.953512,
+        -13.264781, -13.264781, -13.264781, -13.953512, -13.264781, -13.264781, -13.264781, -13.953512, -13.953512, -13.953512,
+        -13.264781, -13.264781, -13.609147, -13.264781, -13.264781, -13.609147, -12.920415, -12.576049, -12.920415, -13.264781,
+        -13.264781, -13.264781, -13.264781, -13.609147, -13.609147, -12.920415, -12.920415, -13.264781, -13.264781, -12.920415,
+        -13.609147, -13.609147, -13.609147, -13.264781, -12.920415, -13.609147, -13.264781, -13.264781, -13.609147, -13.264781,
+        -13.264781, -12.576049, -12.920415, -13.609147, -13.609147, -13.609147, -13.264781, -12.576049, -12.920415, -13.953512,
+        -13.264781, -12.920415, -12.920415, -12.920415, -13.609147, -12.920415, -13.264781, -13.264781, -12.920415, -13.609147,
+        -13.609147, -13.609147, -13.264781, -13.264781, -13.264781, -13.609147, -12.920415, -13.953512, -13.264781, -13.609147,
+        -13.609147, -13.264781, -13.953512, -13.264781, -13.264781, -12.920415, -12.920415, -13.609147, -14.297878, -13.264781,
+        -13.264781, -12.920415, -13.264781, -13.264781, -13.609147, -12.576049, -13.264781, -12.576049, -13.609147, -12.920415,
+        -13.264781, -13.264781, -13.264781, -13.609147, -13.264781, -13.264781, -14.98661, -13.264781, -12.920415, -12.920415,
+        -12.920415, -13.264781, -12.920415, -13.609147, -13.264781, -12.576049, -12.920415, -12.920415, -12.576049, -13.264781,
+        -13.609147, -13.609147, -13.609147, -13.609147, -13.609147, -13.264781, -13.264781, -13.609147, -12.920415, -13.609147,
+        -13.264781, -13.609147, -13.264781, -13.609147, -13.264781, -13.953512, -13.264781, -13.264781, -13.609147, -13.264781,
+        -12.576049, -14.297878, -13.264781, -13.609147, -12.920415, -13.953512, -13.264781, -13.609147, -13.953512, -13.609147,
+        -12.920415, -13.609147, -13.264781, -13.609147, -13.264781, -13.264781, -13.264781, -13.609147, -13.609147, -13.264781,
+        -13.264781, -13.264781, -12.920415, -12.576049, -13.264781, -13.609147, -13.953512, -13.264781, -13.264781, -12.920415,
+        -13.609147, -13.264781, -13.264781, -13.264781, -13.264781, -13.264781, -12.920415, -12.920415, -14.297878, -13.264781,
+        -13.264781, -13.264781, -13.609147, -13.609147, -13.609147, -13.264781, -13.264781, -13.264781, -13.264781, -13.264781,
+        -13.264781, -12.576049, -13.264781, -13.264781, -13.264781, -13.609147, -13.264781, -12.920415, -12.920415, -13.264781,
+        -12.920415, -13.264781, -13.264781, -13.609147, -13.264781, -12.920415, -13.264781, -13.264781, -13.609147, -13.264781,
+        -13.953512, -13.609147, -12.920415, -13.264781, -13.264781, -13.609147, -13.264781, -13.609147, -13.264781, -13.264781,
+        -13.264781, -13.264781, -13.953512, -12.920415, -13.609147, -13.264781, -12.920415, -13.953512, -13.264781, -12.920415,
+        -12.920415, -13.264781, -13.609147, -13.953512, -13.609147, -13.953512, -13.609147, -12.920415, -13.609147, -13.609147,
+        -13.264781, -13.953512, -13.609147, -13.609147, -13.264781, -13.609147, -13.264781, -13.953512, -12.231683, -12.576049,
+        -12.920415, -12.920415, -13.264781, -13.264781, -13.609147, -12.920415, -13.264781, -12.920415, -13.953512, -12.920415,
+        -13.264781, -13.264781, -12.576049, -13.609147, -13.264781, -13.264781, -13.264781, -12.576049, -13.264781, -13.609147,
+        -13.264781, -13.264781, -13.264781, -13.609147, -12.920415, -13.609147, -13.609147, -13.264781, -13.264781, -13.264781,
+        -13.264781, -13.609147, -13.264781, -12.920415, -12.920415, -13.264781, -12.576049, -13.609147, -13.264781, -13.953512,
+        -12.920415, -13.264781, -13.609147, -13.264781, -13.264781, -13.953512, -13.609147, -12.920415, -13.609147, -12.920415,
+        -13.264781, -13.264781, -13.609147, -13.264781, -12.920415, -12.920415, -12.576049, -12.231683, -12.576049, -12.920415,
+        -13.953512, -13.609147, -13.264781, -12.576049, -12.920415, -12.920415, -13.264781, -12.920415, -12.920415, -12.920415,
+        -12.920415, -13.264781, -13.609147, -13.264781, -12.576049, -12.576049, -12.920415, -13.264781, -13.264781, -13.264781,
+        -13.264781, -12.920415, -12.920415, -12.920415, -12.576049, -12.576049, -12.920415, -13.609147, -12.576049, -13.264781,
+        -12.576049, -11.887317, -13.264781, -13.609147, -12.920415, -12.576049, -12.576049, -12.920415, -12.920415, -12.920415,
+        -13.264781, -12.920415, -12.576049, -12.576049, -12.576049, -12.920415, -13.264781, -13.264781, -12.920415, -12.576049,
+        -12.920415, -13.264781, -12.920415, -13.264781, -12.576049, -12.231683, -12.920415, -12.920415, -13.264781, -13.264781,
+        -12.576049, -12.920415, -13.264781, -12.920415, -13.264781, -12.920415, -12.920415, -12.920415, -13.264781, -12.920415,
+        -12.920415, -12.576049, -12.576049, -12.576049, -12.920415, -12.231683, -12.576049, -13.609147, -12.576049, -13.264781,
+        -12.576049, -12.920415, -13.264781, -12.576049, -11.887317, -12.231683, -12.920415, -13.264781, -13.609147, -13.264781,
+        -12.576049, -12.576049, -13.264781, -13.264781, -13.953512, -13.264781, -12.920415, -13.264781, -12.920415, -13.264781,
+        -13.264781, -12.231683, -12.920415, -12.576049, -12.920415, -13.264781, -12.920415, -13.264781, -12.920415, -12.920415,
+        -12.920415, -13.264781, -13.264781, -12.920415, -12.920415, -6.033098
+    };
+    // Leftward perturbation (new list)
+    /*
+    void M2ProbMoveState::loadPerturbationForces() {
+    // Static injection: measured segments hard-coded (frame-by-frame replay)
+    // Upward perturbation (new list)
+    upPerturbForce = {
+        6.887317, 7.231683, 6.887317, 7.576049, 7.920415, 7.920415, 8.264781, 7.920415, 7.576049, 7.920415,
+        7.576049, 7.576049, 7.920415, 7.920415, 7.576049, 7.576049, 8.609147, 7.920415, 7.231683, 7.920415,
+        8.264781, 8.609147, 7.920415, 7.920415, 7.576049, 8.264781, 8.264781, 7.920415, 7.920415, 8.264781,
+        7.920415, 7.920415, 8.609147, 8.609147, 7.920415, 8.264781, 7.576049, 7.576049, 7.576049, 7.231683,
+        8.264781, 7.920415, 7.920415, 7.920415, 7.231683, 7.920415, 7.576049, 7.576049, 7.576049, 7.576049,
+        7.231683, 7.231683, 8.609147, 7.576049, 7.920415, 7.920415, 7.576049, 7.576049, 8.264781, 7.231683,
+        8.609147, 7.576049, 8.264781, 8.609147, 7.920415, 7.920415, 7.576049, 7.920415, 7.920415, 7.920415,
+        7.920415, 8.264781, 7.920415, 7.920415, 7.920415, 7.920415, 8.264781, 8.264781, 7.231683, 7.920415,
+        8.264781, 8.609147, 8.264781, 8.609147, 7.920415, 8.609147, 7.920415, 8.264781, 8.264781, 8.264781,
+        7.920415, 8.264781, 7.920415, 7.576049, 7.576049, 7.576049, 8.264781, 8.264781, 7.576049, 7.920415,
+        8.609147, 8.264781, 7.920415, 7.231683, 8.609147, 7.920415, 8.953512, 7.576049, 8.264781, 8.264781,
+        7.920415, 8.264781, 7.576049, 8.264781, 8.264781, 7.920415, 8.609147, 8.609147, 7.920415, 7.920415,
+        8.953512, 8.264781, 7.920415, 8.264781, 7.576049, 8.609147, 8.264781, 7.920415, 7.920415, 7.576049,
+        8.609147, 8.264781, 8.264781, 8.264781, 8.609147, 8.609147, 8.264781, 8.953512, 8.609147, 7.576049,
+        7.920415, 7.576049, 8.264781, 8.264781, 7.920415, 8.264781, 8.609147, 8.609147, 7.920415, 8.953512,
+        8.609147, 8.609147, 7.231683, 8.953512, 7.920415, 8.264781, 8.609147, 8.264781, 8.953512, 8.264781,
+        8.264781, 8.953512, 7.920415, 7.920415, 8.264781, 7.920415, 8.953512, 7.576049, 8.609147, 7.576049,
+        8.953512, 8.264781, 7.920415, 8.609147, 7.231683, 8.264781, 7.576049, 8.264781, 7.920415, 8.264781,
+        8.953512, 7.920415, 8.264781, 7.920415, 8.264781, 7.231683, 8.609147, 8.264781, 7.920415, 8.953512,
+        8.609147, 9.297878, 8.609147, 8.264781, 8.609147, 8.264781, 8.953512, 8.264781, 8.953512, 7.920415,
+        8.609147, 8.953512, 8.609147, 8.953512, 9.297878, 8.264781, 8.264781, 7.920415, 8.264781, 8.609147,
+        8.953512, 8.953512, 8.953512, 8.609147, 7.576049, 9.297878, 7.920415, 8.609147, 8.264781, 8.264781,
+        8.609147, 8.264781, 8.609147, 8.609147, 8.953512, 7.920415, 7.576049, 8.609147, 8.609147, 8.264781,
+        8.264781, 8.264781, 8.264781, 8.953512, 7.920415, 8.264781, 7.920415, 8.264781, 7.920415, 8.609147,
+        8.264781, 8.609147, 7.920415, 8.953512, 8.953512, 8.953512, 8.264781, 7.920415, 8.609147, 8.609147,
+        7.920415, 7.576049, 8.609147, 8.609147, 7.576049, 9.297878, 7.576049, 8.609147, 8.264781, 8.264781,
+        7.920415, 7.920415, 8.609147, 8.264781, 8.609147, 7.920415, 7.920415, 8.264781, 8.264781, 8.609147,
+        8.953512, 7.920415, 7.920415, 7.920415, 7.920415, 8.609147, 7.576049, 7.920415, 7.920415, 7.920415,
+        8.609147, 7.920415, 8.609147, 8.609147, 8.609147, 8.953512, 7.920415, 7.920415, 8.264781, 8.264781,
+        7.920415, 8.264781, 7.920415, 8.609147, 8.609147, 8.609147, 8.609147, 8.953512, 8.609147, 8.609147,
+        7.576049, 8.609147, 7.920415, 8.609147, 8.609147, 8.264781, 8.264781, 7.576049, 7.920415, 7.920415,
+        7.920415, 8.953512, 8.609147, 8.609147, 8.264781, 7.920415, 8.264781, 7.920415, 8.264781, 8.953512,
+        8.264781, 7.920415, 8.609147, 8.609147, 7.920415, 8.609147, 8.953512, 7.920415, 7.920415, 7.920415,
+        7.920415, 8.609147, 7.920415, 8.264781, 8.264781, 8.264781, 8.609147, 7.920415, 7.920415, 8.264781,
+        8.264781, 8.264781, 7.920415, 8.609147, 8.264781, 8.264781, 8.264781, 8.264781, 8.264781, 8.609147,
+        8.609147, 7.920415, 7.920415, 8.264781, 9.297878, 8.609147, 7.576049, 8.264781, 8.609147, 7.920415,
+        7.576049, 7.920415, 8.609147, 9.297878, 8.609147, 8.264781, 7.920415, 8.609147, 7.576049, 7.920415,
+        7.920415, 7.920415, 7.920415, 7.920415, 8.609147, 7.920415, 7.231683, 8.264781, 7.576049, 7.920415,
+        7.920415, 8.264781, 8.264781, 7.576049, 8.264781, 7.576049, 7.920415, 8.609147, 7.920415, 8.264781,
+        7.576049, 8.264781, 8.609147, 8.264781, 7.576049, 8.264781, 7.920415, 7.920415, 7.920415, 7.576049,
+        7.920415, 7.920415, 8.609147, 7.576049, 8.264781, 7.920415, 8.264781, 7.920415, 7.920415, 8.264781,
+        7.920415, 7.920415, 7.231683, 8.264781, 7.576049, 7.920415, 7.920415, 8.264781, 8.264781, 7.576049,
+        7.576049, 7.576049, 7.920415, 8.264781, 7.231683, 8.609147, 8.609147, 8.264781, 7.920415, 7.920415,
+        8.264781, 8.264781, 8.609147, 7.576049, 7.920415, 7.920415, 8.609147, 8.264781, 7.576049, 7.231683,
+        7.231683, 8.264781, 8.264781, 7.920415, 8.609147, 7.576049, 7.920415, 7.920415, 7.920415, 7.920415,
+        8.264781, 8.264781, 7.576049, 7.920415, 7.576049, 7.231683, 7.920415, 8.264781, 7.920415, 8.953512,
+        8.609147, 7.920415, 7.920415, 8.264781, 8.953512, 8.264781, 8.264781, 8.264781, 7.576049, 8.609147,
+        8.264781, 8.264781, 8.264781, 8.264781, 7.920415, 7.576049, 7.920415, 7.920415, 7.231683, 7.576049,
+        8.264781, 7.231683, 8.609147, 8.264781, 7.920415, 8.264781, 1.033098, 0.688732
+    };
+    
+    leftPerturbForce = {
+        -7.231683, -7.920415, -7.576049, -7.920415, -7.576049, -7.920415, -7.920415, -7.920415, -8.264781, -7.920415,
+        -8.264781, -8.264781, -8.264781, -8.264781, -7.920415, -7.920415, -7.920415, -8.264781, -7.920415, -7.576049,
+        -7.920415, -7.920415, -7.576049, -6.887317, -7.576049, -8.264781, -7.231683, -7.920415, -7.920415, -7.920415,
+        -7.576049, -8.953512, -8.264781, -7.920415, -7.920415, -7.576049, -7.231683, -7.576049, -7.920415, -7.920415,
+        -7.231683, -8.264781, -7.920415, -8.953512, -8.264781, -8.609147, -8.264781, -8.264781, -8.609147, -8.264781,
+        -7.920415, -8.264781, -8.264781, -8.609147, -8.264781, -7.231683, -7.231683, -7.576049, -7.920415, -7.920415,
+        -8.264781, -8.264781, -7.231683, -7.576049, -7.920415, -8.264781, -7.920415, -7.231683, -8.264781, -8.609147,
+        -7.576049, -8.264781, -8.264781, -7.920415, -8.264781, -8.609147, -8.609147, -8.264781, -7.920415, -8.264781,
+        -8.264781, -8.264781, -8.264781, -7.920415, -7.920415, -7.920415, -8.264781, -8.264781, -8.264781, -7.920415,
+        -8.609147, -8.264781, -8.264781, -8.264781, -8.264781, -8.609147, -7.576049, -8.264781, -8.264781, -8.264781,
+        -8.264781, -7.920415, -7.920415, -7.920415, -7.920415, -7.576049, -8.609147, -8.264781, -8.609147, -7.920415,
+        -8.953512, -7.920415, -8.264781, -7.920415, -8.264781, -8.609147, -8.609147, -8.609147, -8.264781, -8.953512,
+        -8.264781, -8.264781, -8.264781, -8.953512, -8.264781, -8.264781, -8.264781, -8.953512, -8.953512, -8.953512,
+        -8.264781, -8.264781, -8.609147, -8.264781, -8.264781, -8.609147, -7.920415, -7.576049, -7.920415, -8.264781,
+        -8.264781, -8.264781, -8.264781, -8.609147, -8.609147, -7.920415, -7.920415, -8.264781, -8.264781, -7.920415,
+        -8.609147, -8.609147, -8.609147, -8.264781, -7.920415, -8.609147, -8.264781, -8.264781, -8.609147, -8.264781,
+        -8.264781, -7.576049, -7.920415, -8.609147, -8.609147, -8.609147, -8.264781, -7.576049, -7.920415, -8.953512,
+        -8.264781, -7.920415, -7.920415, -7.920415, -8.609147, -7.920415, -8.264781, -8.264781, -7.920415, -8.609147,
+        -8.609147, -8.609147, -8.264781, -8.264781, -8.264781, -8.609147, -7.920415, -8.953512, -8.264781, -8.609147,
+        -8.609147, -8.264781, -8.953512, -8.264781, -8.264781, -7.920415, -7.920415, -8.609147, -9.297878, -8.264781,
+        -8.264781, -7.920415, -8.264781, -8.264781, -8.609147, -7.576049, -8.264781, -7.576049, -8.609147, -7.920415,
+        -8.264781, -8.264781, -8.264781, -8.609147, -8.264781, -8.264781, -9.98661, -8.264781, -7.920415, -7.920415,
+        -7.920415, -8.264781, -7.920415, -8.609147, -8.264781, -7.576049, -7.920415, -7.920415, -7.576049, -8.264781,
+        -8.609147, -8.609147, -8.609147, -8.609147, -8.609147, -8.264781, -8.264781, -8.609147, -7.920415, -8.609147,
+        -8.264781, -8.609147, -8.264781, -8.609147, -8.264781, -8.953512, -8.264781, -8.264781, -8.609147, -8.264781,
+        -7.576049, -9.297878, -8.264781, -8.609147, -7.920415, -8.953512, -8.264781, -8.609147, -8.953512, -8.609147,
+        -7.920415, -8.609147, -8.264781, -8.609147, -8.264781, -8.264781, -8.264781, -8.609147, -8.609147, -8.264781,
+        -8.264781, -8.264781, -7.920415, -7.576049, -8.264781, -8.609147, -8.953512, -8.264781, -8.264781, -7.920415,
+        -8.609147, -8.264781, -8.264781, -8.264781, -8.264781, -8.264781, -7.920415, -7.920415, -9.297878, -8.264781,
+        -8.264781, -8.264781, -8.609147, -8.609147, -8.609147, -8.264781, -8.264781, -8.264781, -8.264781, -8.264781,
+        -8.264781, -7.576049, -8.264781, -8.264781, -8.264781, -8.609147, -8.264781, -7.920415, -7.920415, -8.264781,
+        -7.920415, -8.264781, -8.264781, -8.609147, -8.264781, -7.920415, -8.264781, -8.264781, -8.609147, -8.264781,
+        -8.953512, -8.609147, -7.920415, -8.264781, -8.264781, -8.609147, -8.264781, -8.609147, -8.264781, -8.264781,
+        -8.264781, -8.264781, -8.953512, -7.920415, -8.609147, -8.264781, -7.920415, -8.953512, -8.264781, -7.920415,
+        -7.920415, -8.264781, -8.609147, -8.953512, -8.609147, -8.953512, -8.609147, -7.920415, -8.609147, -8.609147,
+        -8.264781, -8.953512, -8.609147, -8.609147, -8.264781, -8.609147, -8.264781, -8.953512, -7.231683, -7.576049,
+        -7.920415, -7.920415, -8.264781, -8.264781, -8.609147, -7.920415, -8.264781, -7.920415, -8.953512, -7.920415,
+        -8.264781, -8.264781, -7.576049, -8.609147, -8.264781, -8.264781, -8.264781, -7.576049, -8.264781, -8.609147,
+        -8.264781, -8.264781, -8.264781, -8.609147, -7.920415, -8.609147, -8.609147, -8.264781, -8.264781, -8.264781,
+        -8.264781, -8.609147, -8.264781, -7.920415, -7.920415, -8.264781, -7.576049, -8.609147, -8.264781, -8.953512,
+        -7.920415, -8.264781, -8.609147, -8.264781, -8.264781, -8.953512, -8.609147, -7.920415, -8.609147, -7.920415,
+        -8.264781, -8.264781, -8.609147, -8.264781, -7.920415, -7.920415, -7.576049, -7.231683, -7.576049, -7.920415,
+        -8.953512, -8.609147, -8.264781, -7.576049, -7.920415, -7.920415, -8.264781, -7.920415, -7.920415, -7.920415,
+        -7.920415, -8.264781, -8.609147, -8.264781, -7.576049, -7.576049, -7.920415, -8.264781, -8.264781, -8.264781,
+        -8.264781, -7.920415, -7.920415, -7.920415, -7.576049, -7.576049, -7.920415, -8.609147, -7.576049, -8.264781,
+        -7.576049, -6.887317, -8.264781, -8.609147, -7.920415, -7.576049, -7.576049, -7.920415, -7.920415, -7.920415,
+        -8.264781, -7.920415, -7.576049, -7.576049, -7.576049, -7.920415, -8.264781, -8.264781, -7.920415, -7.576049,
+        -7.920415, -8.264781, -7.920415, -8.264781, -7.576049, -7.231683, -7.920415, -7.920415, -8.264781, -8.264781,
+        -7.576049, -7.920415, -8.264781, -7.920415, -8.264781, -7.920415, -7.920415, -7.920415, -8.264781, -7.920415,
+        -7.920415, -7.576049, -7.576049, -7.576049, -7.920415, -7.231683, -7.576049, -8.609147, -7.576049, -8.264781,
+        -7.576049, -7.920415, -8.264781, -7.576049, -6.887317, -7.231683, -7.920415, -8.264781, -8.609147, -8.264781,
+        -7.576049, -7.576049, -8.264781, -8.264781, -8.953512, -8.264781, -7.920415, -8.264781, -7.920415, -8.264781,
+        -8.264781, -7.231683, -7.920415, -7.576049, -7.920415, -8.264781, -7.920415, -8.264781, -7.920415, -7.920415,
+        -7.920415, -8.264781, -8.264781, -7.920415, -7.920415, -1.033098
+    };*/
+
+    spdlog::info("[STATIC] Loaded {} up and {} left perturbation samples (hard-coded).", upPerturbForce.size(), leftPerturbForce.size());
+}
