@@ -113,6 +113,10 @@ public:
     size_t perturbIndex = 0;
     bool injectingUp = false;
     bool injectingLeft = false;
+    // --- WAIT_START hold-at-A configuration ---
+    bool waitHoldLatched_ = false;  
+    double k_hold = 2000.0;           
+    double d_hold = 10.0;            
 
     // --- Perturbation CSV loading functions ---
     std::vector<double> loadColumnFromCSV(const std::string& path, int colIndex, double tStart, double tEnd);
@@ -125,13 +129,19 @@ public:
 
     double epsA = 0.05;
     double epsC = 0.05;
+    
+    double lastTrpsT_ = -1.0;
+    double trpsMinInterval_ = 0.5; // 20Hz
 
-    double k = 60;
+    std::vector<VM2> trialEndPositions_;   
+    bool sendPosOnlyOnTimeout_ = false;    
+    
+    double k = 50;
     double d = 6;
 
     double robotForceMagUp  = 35;
     double robotForceMagLeft= 17.5;
-
+    
     double internalForceDur  = 1.2;
     double trialMaxTime      = 1.2;
 
@@ -140,8 +150,7 @@ public:
     double userForceScale   = 5;
     double forceSaturation   = 80.0;
     double Dv               = 5.0;
-    // double Ft_mag       = 15;
-    // double Dv           = 5.0;
+
     double rampUp       = 0.5;
     double rampDown     = 0.2;
 
@@ -157,9 +166,9 @@ public:
     // --- Meta parameters received from UI ---
     int    meta_scoreMode   = 1;
     int    meta_targetSucc  = 10;
-    int    meta_maxTrials   = 20;
+    int    meta_maxTrials   = 10;
 
-    double V2_Smax = 100.0;
+    double V2_Smax = 110.0;
 
     // ToA related variables
     double holdTimeA  = 0.25;
@@ -187,6 +196,7 @@ private:
     void openCSV();
     // Deterministic schedule for LEFT/UP within a 10-trial block: -1=LEFT, +1=UP
     std::vector<int> trialSchedule_;
+
     size_t trialIdx_ = 0;
     void buildDeterministicSchedule();
 
@@ -207,9 +217,9 @@ private:
     // MERGED: Variables from M2TrialState are now here
     double trialStartTime = 0.0;
     double effortIntegral = 0.0;
-    // 原始累计冲量（N·s），未扣基线
+
     double rawEffortIntegral = 0.0;
-    // 方向相关的基线冲量（N·s）：Up≈32，Left≈12
+
     double baselineImpulseN = 0.0;
     
     bool finishedFlag = false;
@@ -231,7 +241,7 @@ private:
 
     static bool isPrintableAscii(const std::string& s) {
         for (unsigned char ch : s) {
-            if (ch < 0x20 || ch > 0x7E) { // TAB/CR/LF 也当不可打印：根据需要放行
+            if (ch < 0x20 || ch > 0x7E) { 
                 if (ch!='\n' && ch!='\r' && ch!='\t') return false;
             }
         }

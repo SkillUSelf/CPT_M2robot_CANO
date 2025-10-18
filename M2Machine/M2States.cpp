@@ -5,6 +5,7 @@
 #include <cmath>
 #include <algorithm>
 #include <sstream>
+#include <random>
 
 // Provide system_time_sec() locally
 static inline double system_time_sec() {
@@ -16,17 +17,10 @@ static inline double system_time_sec() {
 void M2ProbMoveState::sendUI_(const std::string& msg) {
     const int seq = ++this->txSeq_;
     const size_t L = msg.size();
-    if (isPrintableAscii(msg)) {
-        spdlog::info("[TX seq={}] [len={}] {}", seq, L, msg);
-    } else {
-        spdlog::warn("[TX seq={}] [len={}] (non-printable)", seq, L);
-        spdlog::warn("[TX seq={}] HEX: {}", seq, hexDump(msg));
-    }
+
     if (machine && machine->UIserver) {
         machine->UIserver->sendCmd(msg);
-    } else {
-        spdlog::error("[TX seq={}] sendCmd skipped (UIserver null)", seq);
-    }
+    } 
 }
 static inline double MinJerk(const VM2& X0, const VM2& Xf, double T, double t,
                              VM2& Xd, VM2& dXd, VM2* ddXd=nullptr){
@@ -128,7 +122,7 @@ void M2StandbyState::duringCode() {
 
     VM2 Fs = robot->getEndEffForce();
     // Periodic status print
-    if (iterations()%200==1) 
+    if (iterations()%1000==1) 
         robot->printStatus();
 
     // Lightweight logging every N iterations
@@ -145,7 +139,16 @@ void M2StandbyState::exitCode() {
 
 void M2StandbyState::openStandbyCSV_() {
     // Append mode to keep a continuous session log
-    standbyCsv_.open("logs/StandbyLog.csv", std::ios::out | std::ios::app);
+    // standbyCsv_.open("logs/StandbyLog.csv", std::ios::out | std::ios::app);
+    const std::string sid = (machine && !machine->sessionId.empty()) ? machine->sessionId : std::string("UNSET");
+
+    const std::string fname = std::string("logs/Standby_") + sid + ".csv";
+
+    standbyCsv_.open(fname, std::ios::out | std::ios::app);
+    if (!standbyCsv_.is_open()) {
+        spdlog::error("Failed to open Standby CSV: {}", fname);
+        return;
+    }
     if (standbyCsv_.tellp() == 0) {
         standbyCsv_ << "time,sys_time,session_id,pos_x,pos_y,vel_x,vel_y,fcmd_x,fcmd_y,fs_x,fs_y\n";
     }
@@ -176,6 +179,7 @@ M2ProbMoveState::M2ProbMoveState(RobotM2* M2, M2Machine* mach, const char* name)
 void M2ProbMoveState::entryCode() {
     robot->initTorqueControl();
     robot->setEndEffForceWithCompensation(VM2::Zero(), false);
+    trialEndPositions_.clear(); 
     finishedFlag = false;
     rng.seed(std::random_device{}());
     openCSV();
@@ -201,7 +205,7 @@ void M2ProbMoveState::entryCode() {
     injectingUp = false;
     injectingLeft = false;
     inBandSince = 0.0;
-
+    waitHoldLatched_ = false;
     // Load perturbation forces from CSV
     loadPerturbationForces();
     buildDeterministicSchedule();
@@ -212,14 +216,12 @@ void M2ProbMoveState::duringCode() {
     // === GLOBAL COMMAND DRAIN ===
     
     {
-        int guard = 16;
+        int guard = 256;
         while (guard-- > 0 && machine && machine->UIserver && machine->UIserver->isCmd()) {
             std::string c; std::vector<double> a;
             machine->UIserver->getCmd(c, a);
             
-            if (machine && machine->UIserver) {
-                machine->UIserver->sendCmd(std::string("ECHO ") + c);
-            }
+
             auto trim = [](std::string s){
                 auto notspace = [](int ch){ return !std::isspace(ch); };
                 s.erase(s.begin(), std::find_if(s.begin(), s.end(), notspace));
@@ -244,6 +246,7 @@ void M2ProbMoveState::duringCode() {
                 inBandSince    = 0.0;
                 effortIntegral = 0.0;
                 betweenTrials  = false;
+                waitHoldLatched_ = false;
                 if (machine && machine->UIserver) machine->UIserver->sendCmd("OK");
                 machine->UIserver->clearCmd();
                 spdlog::info("GLOBAL: RSTA -> TO_A");
@@ -370,7 +373,7 @@ void M2ProbMoveState::duringCode() {
 
             if (atA) {
                 currentPhase = WAIT_START;
-                betweenTrials = true;                 // 进入两次试次之间，允许改 S_MD/S_MT/S_TS
+                betweenTrials = true;               
                 spdlog::info("TO_A -> WAIT_START (betweenTrials=1)");
             }
             break;
@@ -393,12 +396,13 @@ void M2ProbMoveState::duringCode() {
                 betweenTrials = false;  
                 currentPhase  = TRIAL;
                 initTrial     = true;
+                waitHoldLatched_ = false; // release A hold when trial begins
                 if (machine && machine->UIserver) machine->UIserver->sendCmd("OK");
                 spdlog::info("WAIT_START: pendingStart consumed -> TRIAL (atA_hold=1)");
                 break; 
             } else if (pendingStart && !atA_hold) {
                 
-                if (iterations() % 200 == 1) {
+                if (iterations() % 1000 == 1) {
                     spdlog::info("WAIT_START: STRT pending but not at A (dist={:.3f} <? {:.3f})", distToA, epsA_hold);
                 }
             }
@@ -412,7 +416,23 @@ void M2ProbMoveState::duringCode() {
                     finishedFlag ? 1 : 0
                 );
             }
-            robot->setEndEffForceWithCompensation(VM2::Zero());
+            
+            if (atA_hold) {
+                waitHoldLatched_ = true;
+            }
+
+            if (waitHoldLatched_) {
+                
+                VM2 Xh  = robot->getEndEffPosition();
+                VM2 dXh = robot->getEndEffVelocity();
+                Eigen::Matrix2d K = Eigen::Matrix2d::Identity() * k_hold;
+                Eigen::Matrix2d D = Eigen::Matrix2d::Identity() * d_hold;
+                VM2 F_hold = K * (A - Xh) + D * (VM2::Zero() - dXh);
+                applyForce(F_hold);  
+            } else {
+                
+                robot->setEndEffForceWithCompensation(VM2::Zero());
+            }
   
             break;
         }
@@ -425,10 +445,10 @@ void M2ProbMoveState::duringCode() {
                 decideInternalForceDirection();
                 effortIntegral = 0.0;
                 rawEffortIntegral = 0.0;
-                // 依据注入力方向设定基线冲量（单位 N·s）
-                if (injectingUp)       baselineImpulseN = 32.0;   // 你测得的“向上”基线冲量
-                else if (injectingLeft) baselineImpulseN = 12.0;  // 你测得的“向左”基线冲量
-                else                    baselineImpulseN = 0.0;   // 无注入就不扣
+                
+                if (injectingUp)       baselineImpulseN = 4000;   
+                else if (injectingLeft) baselineImpulseN = 5270;  
+                else                    baselineImpulseN = 0.0;  
 
                 if (machine && machine->UIserver) {
                     std::ostringstream oss;
@@ -454,6 +474,7 @@ void M2ProbMoveState::duringCode() {
                         p.push_back((double)curTrialForMode);                    // cur
                         p.push_back((double)meta_maxTrials);                     // max
                         machine->UIserver->sendCmd("TRBG", p);
+                        spdlog::info("TRBBBBB");
                     }
                 }
                 spdlog::info(
@@ -472,7 +493,7 @@ void M2ProbMoveState::duringCode() {
 
             VM2 X = robot->getEndEffPosition();
             VM2 dX = robot->getEndEffVelocity();
-            VM2 F_damp = -Dv * dX;
+
             double n = (C - X).norm();
             double tTrial = running() - trialStartTime;
 
@@ -487,25 +508,39 @@ void M2ProbMoveState::duringCode() {
                 }
             } else if (injectingLeft) {
                 if (perturbIndex < leftPerturbForce.size()) {
-                    F_int(0) = leftPerturbForce[perturbIndex++];
+                    F_int(0) = leftPerturbForce[perturbIndex++]-10;
                 }
             }
 
             VM2 F_cmd = F_int + impedance(robot->getEndEffPosition(), X, dX);
+            const double x_min = 0.1;   // left boundary (m)
+            const double k_wall = 200.0; // wall stiffness N/m
+            const double d_wall = 40.0;  // wall damping N·s/m
+
+            if (X(0) < x_min) {
+                // penetration depth (negative when past wall)
+                double pen = x_min - X(0);
+                // Only apply when robot is "beyond" wall (pen > 0)
+                if (pen > 0.0) {
+                    double F_wall_x = k_wall * pen - d_wall * dX(0); // push back rightward
+                    if (F_wall_x > 0.0) {
+                        F_cmd(0) += F_wall_x;  // add wall force
+                    }
+                }
+            }
             applyForce(F_cmd);
             // --- Effort calculation based on commanded force (Standby-style) ---
             VM2 F_user = robot->getEndEffForce();  // sensor-measured interaction force
             const double Fu_norm = F_user.norm();
+            const double vv = dX.norm();
+            rawEffortIntegral += Fu_norm * vv;
+            
+            
 
-            // 先累计原始冲量（N·s），再统一扣除方向基线冲量（同为N·s），并截断为非负
-            rawEffortIntegral += Fu_norm * dt();
-            effortIntegral = std::max(0.0, rawEffortIntegral - baselineImpulseN);
+            effortIntegral = 0.05*std::abs(rawEffortIntegral - baselineImpulseN);
+            if(effortIntegral < 3)effortIntegral = 0;
 
-            {
-                const double incr = Fu_norm * dt();
-                spdlog::info("[EFFORT] Fs=({:.3f},{:.3f}) |Fs|={:.4f} dt={:.4f} +raw={:.4f} rawTot={:.4f} base={:.3f} humanEff={:.4f}",
-                            F_user(0), F_user(1), Fu_norm, dt(), incr, rawEffortIntegral, baselineImpulseN, effortIntegral);
-            }
+
             writeCSV(running(), X, dX, F_int, F_user, effortIntegral);
 
 
@@ -525,6 +560,41 @@ void M2ProbMoveState::duringCode() {
             // Transition condition check
             bool reachedC = (n < epsC) && (tTrial >= minTrialEvalTime);
             bool timeout = (tTrial >= trialMaxTime);
+            
+            VM2 X_end = robot->getEndEffPosition();   
+            double dist_end = n;                      
+
+            trialEndPositions_.push_back(X_end);      
+
+            const double now = running();
+            if ((!sendPosOnlyOnTimeout_ || timeout) &&(lastTrpsT_ <0.0 || (now -lastTrpsT_) >=trpsMinInterval_)){
+                
+                if (machine && machine->UIserver) {
+                    std::vector<double> q;
+                    int curTrialIdx = (currentMode == V1_COUNT_SUCCESS) ? totalTrialsV1+1 : totalTrialsV2+1;
+                    q.push_back((double)curTrialIdx);        
+                    q.push_back(X_end(0));                   
+                    q.push_back(X_end(1));                   
+                    q.push_back(dist_end);                   
+                    q.push_back(timeout ? 1.0 : 0.0);        
+                    machine->UIserver->sendCmd("TRPS", q); 
+                    spdlog::info("TRPPPP");
+                    lastTrpsT_ = now;
+
+                }
+
+
+                {
+                    std::ostringstream oss;
+                    oss.setf(std::ios::fixed); oss.precision(3);
+                    oss << "TRIAL_POS t=" << running()
+                        << " end=(" << X_end(0) << "," << X_end(1) << ")"
+                        << " dist=" << dist_end
+                        << " timeout=" << (timeout ? 1 : 0);
+                    sendUI_(oss.str());
+                }
+            }
+            
             if (reachedC || timeout) {
                 // Scoring logic is now handled here directly
                 double trialScore = 0;
@@ -538,12 +608,11 @@ void M2ProbMoveState::duringCode() {
                     if (successfulTrials >= meta_targetSucc || totalTrialsV1 >= meta_maxTrials) finishedFlag = true;
                 } else { // V2_EFFORT_DISTANCE
                     totalTrialsV2++;
-                    const double S_max = 100.0;
-                    // 统一评分：即便超时也按当下距离与累计努力给出分数
-                    // 可选：超时附加罚分（使分数更低）
-                    const double baseScore = S_max - 100 * n - effortIntegral;
-                    const double timeoutPenalty = (!reachedC ? 10.0 : 0.0); // 需要可以调
-                    trialScore = baseScore - timeoutPenalty;
+                    const double S_max = 110.0;
+
+                    const double baseScore = S_max - 210 * n - 0.5*effortIntegral;
+                    
+                    trialScore = baseScore;
                     totalScoreV2 += trialScore;
                     if (totalTrialsV2 >= meta_maxTrials) finishedFlag = true;
                 }
@@ -570,7 +639,7 @@ void M2ProbMoveState::duringCode() {
                         oss << " v2_sco=" << totalScoreV2;
                     }
                     std::string out = oss.str();
-                    sendUI_(out);
+                    //sendUI_(out);
                     {
                         std::vector<double> p;
                         int dirCode = (internalForce(0) < -1e-9) ? -1 : ((internalForce(1) > 1e-9) ? 1 : 0);
@@ -596,6 +665,19 @@ void M2ProbMoveState::duringCode() {
                         }
                         p.push_back((double)dirCode);              // dirCode（可选）
                         machine->UIserver->sendCmd("TREN", p);
+                        spdlog::info("TREEEEEE");
+                        std::ostringstream log;
+                        log << "[TREN SEND] ("
+                            << "t=" << p[0] << ", dur=" << p[1]
+                            << ", reached=" << p[2] << ", dist=" << p[3]
+                            << ", effort=" << p[4] << ", trialScore=" << p[5]
+                            << ", mode=" << p[6] << ", cur=" << p[7]
+                            << ", max=" << p[8]
+                            << ", v1_suc=" << p[9] << ", v1_tar=" << p[10]
+                            << ", v2_sco=" << p[11]
+                            << ", dirCode=" << p.back() << ")";
+                        spdlog::info("{}", log.str());
+
                     }
                 }
                 if (!finishedFlag) {
@@ -621,6 +703,7 @@ void M2ProbMoveState::duringCode() {
 
 void M2ProbMoveState::exitCode() {
     robot->setEndEffForceWithCompensation(VM2::Zero());
+    waitHoldLatched_ = false;
     if (csv.is_open()) csv.close();
 
     if (machine && machine->UIserver) {
@@ -631,7 +714,7 @@ void M2ProbMoveState::exitCode() {
             << " V1_success=" << successfulTrials << " V1_trials=" << totalTrialsV1
             << " V2_score=" << totalScoreV2 << " V2_trials=" << totalTrialsV2;
         std::string out = oss.str();
-        sendUI_(out);// 追加发送 4-char 协议帧：SESS (mode, V1_success, V1_trials, V2_score, V2_trials)
+        sendUI_(out);
         {
             std::vector<double> p;
             p.push_back((double)(currentMode == V1_COUNT_SUCCESS ? 1 : 2));
@@ -640,6 +723,7 @@ void M2ProbMoveState::exitCode() {
             p.push_back(totalScoreV2);
             p.push_back((double)totalTrialsV2);
             machine->UIserver->sendCmd("SESS", p);
+            spdlog::info("SESSSSS");
         }
     }
 }
@@ -667,12 +751,7 @@ VM2 M2ProbMoveState::readUserForce() {
     }
     return f;
 }
-/*
-VM2 M2ProbMoveState::readUserForce() {
-    // 首选：真实交互力
-    return robot->getEndEffInteractionForce();
-}
-*/
+
 void M2ProbMoveState::decideInternalForceDirection() {
     if (trialSchedule_.empty()) buildDeterministicSchedule();
     int dirFlag = trialSchedule_[trialIdx_ % trialSchedule_.size()];
@@ -694,15 +773,72 @@ void M2ProbMoveState::resetToAIntegrators() {
     iErrToA.setZero();
 }
 
+
+
 void M2ProbMoveState::buildDeterministicSchedule() {
     trialSchedule_.clear();
-    // 限定 10%..90%
+    const int seed = 1456070;
+    const int total = 10;
+    
+    const double eps = 1e-3;
+    if (probLeft <= eps) {                 // 0% 左：全 UP(+1)
+        trialSchedule_.assign(total, +1);
+        trialIdx_ = 0;
+        
+        return;
+    }
+    if (probLeft >= 1.0 - eps) {           // 100% 左：全 LEFT(-1)
+        trialSchedule_.assign(total, -1);
+        trialIdx_ = 0;
+        
+        return;
+    }
+    
+    int leftCount = static_cast<int>(std::round(probLeft * static_cast<double>(total)));
+    leftCount = std::max(1, std::min(total - 1, leftCount));
+
+    
+    std::vector<int> schedule(total, +1);
+    for (int i = 0; i < leftCount; ++i) schedule[i] = -1;
+
+    // seed 
+    std::mt19937_64 rng(seed);
+
+    auto is_strict_alternating = [&](const std::vector<int>& v) -> bool {
+        
+        for (int i = 0; i < total; ++i) {
+            if (v[i] == v[(i + 1) % total]) return false;
+        }
+        return true;
+    };
+
+    
+    const bool fifty_fifty = (leftCount * 2 == total);
+    int attempts = 0;
+    const int max_attempts = 64; 
+
+    do {
+        std::shuffle(schedule.begin(), schedule.end(), rng);
+        attempts++;
+        
+        if (!(fifty_fifty && is_strict_alternating(schedule))) break;
+    } while (attempts < max_attempts);
+
+    trialSchedule_ = std::move(schedule);
+    trialIdx_ = 0;
+
+    spdlog::info("[SCHEDULE] Built seeded schedule (total={}, leftCount={}, seed={}, attempts={})",
+                 total, leftCount, seed, attempts);
+}
+
+/*void M2ProbMoveState::buildDeterministicSchedule() {
+    trialSchedule_.clear();
+    
     int leftCount = static_cast<int>(std::round(probLeft * 10.0));
     leftCount = std::max(1, std::min(9, leftCount));
 
     const int total = 10;
-    trialSchedule_.assign(total, +1); // 默认向上
-    // 把 LEFT 均匀地、确定性地铺在 10 个位置上（固定算法，无随机种子）
+    trialSchedule_.assign(total, +1); 
     for (int k = 0; k < leftCount; ++k) {
         int pos = static_cast<int>(std::floor((k + 0.5) * (double)total / (double)leftCount)) % total;
         trialSchedule_[pos] = -1;
@@ -710,10 +846,19 @@ void M2ProbMoveState::buildDeterministicSchedule() {
     trialIdx_ = 0;
 
     spdlog::info("[SCHEDULE] Built deterministic 10-trial schedule (leftCount={})", leftCount);
-}
+}*/
 
 void M2ProbMoveState::openCSV() {
-    csv.open("logs/M2ProbMoveState.csv", std::ios::out | std::ios::app);
+    // csv.open("logs/M2ProbMoveState.csv", std::ios::out | std::ios::app);
+    const std::string sid = (machine && !machine->sessionId.empty()) ? machine->sessionId : std::string("UNSET");
+
+    const std::string fname = std::string("logs/M2ProbMove_") + sid + ".csv";
+
+    csv.open(fname, std::ios::out | std::ios::app);
+    if (!csv.is_open()) {
+        spdlog::error("Failed to open ProbMove CSV: {}", fname);
+        return;
+    }
     if (csv.tellp() == 0) {
         // MODIFIED: Added effort to CSV header
         csv << "time,sys_time,session_id,pos_x,pos_y,vel_x,vel_y,internal_fx,internal_fy,user_fx,user_fy,prob_left,score_mode,target_succ,max_trials,effort\n";
@@ -751,10 +896,9 @@ void M2ProbMoveState::applyForce(const VM2& F) {
 // --- CSV perturbation force loading helpers ---
 
 void M2ProbMoveState::loadPerturbationForces() {
-    // Static injection: measured segments hard-coded (frame-by-frame replay)
-    // Upward perturbation (new list)
+
     upPerturbForce = {
-        24.887317, 25.231683, 24.887317, 25.576049, 25.920415, 25.920415, 26.264781, 25.920415, 25.576049, 25.920415,
+        27.887317, 25.231683, 24.887317, 25.576049, 25.920415, 25.920415, 26.264781, 25.920415, 25.576049, 25.920415,
         25.576049, 25.576049, 25.920415, 25.920415, 25.576049, 25.576049, 26.609147, 25.920415, 25.231683, 25.920415,
         26.264781, 26.609147, 25.920415, 25.920415, 25.576049, 26.264781, 26.264781, 25.920415, 25.920415, 26.264781,
         25.920415, 25.920415, 26.609147, 26.609147, 25.920415, 26.264781, 25.576049, 25.576049, 25.576049, 25.231683,
@@ -860,119 +1004,7 @@ void M2ProbMoveState::loadPerturbationForces() {
         -13.264781, -12.231683, -12.920415, -12.576049, -12.920415, -13.264781, -12.920415, -13.264781, -12.920415, -12.920415,
         -12.920415, -13.264781, -13.264781, -12.920415, -12.920415, -6.033098
     };
-    // Leftward perturbation (new list)
-    /*
-    void M2ProbMoveState::loadPerturbationForces() {
-    // Static injection: measured segments hard-coded (frame-by-frame replay)
-    // Upward perturbation (new list)
-    upPerturbForce = {
-        6.887317, 7.231683, 6.887317, 7.576049, 7.920415, 7.920415, 8.264781, 7.920415, 7.576049, 7.920415,
-        7.576049, 7.576049, 7.920415, 7.920415, 7.576049, 7.576049, 8.609147, 7.920415, 7.231683, 7.920415,
-        8.264781, 8.609147, 7.920415, 7.920415, 7.576049, 8.264781, 8.264781, 7.920415, 7.920415, 8.264781,
-        7.920415, 7.920415, 8.609147, 8.609147, 7.920415, 8.264781, 7.576049, 7.576049, 7.576049, 7.231683,
-        8.264781, 7.920415, 7.920415, 7.920415, 7.231683, 7.920415, 7.576049, 7.576049, 7.576049, 7.576049,
-        7.231683, 7.231683, 8.609147, 7.576049, 7.920415, 7.920415, 7.576049, 7.576049, 8.264781, 7.231683,
-        8.609147, 7.576049, 8.264781, 8.609147, 7.920415, 7.920415, 7.576049, 7.920415, 7.920415, 7.920415,
-        7.920415, 8.264781, 7.920415, 7.920415, 7.920415, 7.920415, 8.264781, 8.264781, 7.231683, 7.920415,
-        8.264781, 8.609147, 8.264781, 8.609147, 7.920415, 8.609147, 7.920415, 8.264781, 8.264781, 8.264781,
-        7.920415, 8.264781, 7.920415, 7.576049, 7.576049, 7.576049, 8.264781, 8.264781, 7.576049, 7.920415,
-        8.609147, 8.264781, 7.920415, 7.231683, 8.609147, 7.920415, 8.953512, 7.576049, 8.264781, 8.264781,
-        7.920415, 8.264781, 7.576049, 8.264781, 8.264781, 7.920415, 8.609147, 8.609147, 7.920415, 7.920415,
-        8.953512, 8.264781, 7.920415, 8.264781, 7.576049, 8.609147, 8.264781, 7.920415, 7.920415, 7.576049,
-        8.609147, 8.264781, 8.264781, 8.264781, 8.609147, 8.609147, 8.264781, 8.953512, 8.609147, 7.576049,
-        7.920415, 7.576049, 8.264781, 8.264781, 7.920415, 8.264781, 8.609147, 8.609147, 7.920415, 8.953512,
-        8.609147, 8.609147, 7.231683, 8.953512, 7.920415, 8.264781, 8.609147, 8.264781, 8.953512, 8.264781,
-        8.264781, 8.953512, 7.920415, 7.920415, 8.264781, 7.920415, 8.953512, 7.576049, 8.609147, 7.576049,
-        8.953512, 8.264781, 7.920415, 8.609147, 7.231683, 8.264781, 7.576049, 8.264781, 7.920415, 8.264781,
-        8.953512, 7.920415, 8.264781, 7.920415, 8.264781, 7.231683, 8.609147, 8.264781, 7.920415, 8.953512,
-        8.609147, 9.297878, 8.609147, 8.264781, 8.609147, 8.264781, 8.953512, 8.264781, 8.953512, 7.920415,
-        8.609147, 8.953512, 8.609147, 8.953512, 9.297878, 8.264781, 8.264781, 7.920415, 8.264781, 8.609147,
-        8.953512, 8.953512, 8.953512, 8.609147, 7.576049, 9.297878, 7.920415, 8.609147, 8.264781, 8.264781,
-        8.609147, 8.264781, 8.609147, 8.609147, 8.953512, 7.920415, 7.576049, 8.609147, 8.609147, 8.264781,
-        8.264781, 8.264781, 8.264781, 8.953512, 7.920415, 8.264781, 7.920415, 8.264781, 7.920415, 8.609147,
-        8.264781, 8.609147, 7.920415, 8.953512, 8.953512, 8.953512, 8.264781, 7.920415, 8.609147, 8.609147,
-        7.920415, 7.576049, 8.609147, 8.609147, 7.576049, 9.297878, 7.576049, 8.609147, 8.264781, 8.264781,
-        7.920415, 7.920415, 8.609147, 8.264781, 8.609147, 7.920415, 7.920415, 8.264781, 8.264781, 8.609147,
-        8.953512, 7.920415, 7.920415, 7.920415, 7.920415, 8.609147, 7.576049, 7.920415, 7.920415, 7.920415,
-        8.609147, 7.920415, 8.609147, 8.609147, 8.609147, 8.953512, 7.920415, 7.920415, 8.264781, 8.264781,
-        7.920415, 8.264781, 7.920415, 8.609147, 8.609147, 8.609147, 8.609147, 8.953512, 8.609147, 8.609147,
-        7.576049, 8.609147, 7.920415, 8.609147, 8.609147, 8.264781, 8.264781, 7.576049, 7.920415, 7.920415,
-        7.920415, 8.953512, 8.609147, 8.609147, 8.264781, 7.920415, 8.264781, 7.920415, 8.264781, 8.953512,
-        8.264781, 7.920415, 8.609147, 8.609147, 7.920415, 8.609147, 8.953512, 7.920415, 7.920415, 7.920415,
-        7.920415, 8.609147, 7.920415, 8.264781, 8.264781, 8.264781, 8.609147, 7.920415, 7.920415, 8.264781,
-        8.264781, 8.264781, 7.920415, 8.609147, 8.264781, 8.264781, 8.264781, 8.264781, 8.264781, 8.609147,
-        8.609147, 7.920415, 7.920415, 8.264781, 9.297878, 8.609147, 7.576049, 8.264781, 8.609147, 7.920415,
-        7.576049, 7.920415, 8.609147, 9.297878, 8.609147, 8.264781, 7.920415, 8.609147, 7.576049, 7.920415,
-        7.920415, 7.920415, 7.920415, 7.920415, 8.609147, 7.920415, 7.231683, 8.264781, 7.576049, 7.920415,
-        7.920415, 8.264781, 8.264781, 7.576049, 8.264781, 7.576049, 7.920415, 8.609147, 7.920415, 8.264781,
-        7.576049, 8.264781, 8.609147, 8.264781, 7.576049, 8.264781, 7.920415, 7.920415, 7.920415, 7.576049,
-        7.920415, 7.920415, 8.609147, 7.576049, 8.264781, 7.920415, 8.264781, 7.920415, 7.920415, 8.264781,
-        7.920415, 7.920415, 7.231683, 8.264781, 7.576049, 7.920415, 7.920415, 8.264781, 8.264781, 7.576049,
-        7.576049, 7.576049, 7.920415, 8.264781, 7.231683, 8.609147, 8.609147, 8.264781, 7.920415, 7.920415,
-        8.264781, 8.264781, 8.609147, 7.576049, 7.920415, 7.920415, 8.609147, 8.264781, 7.576049, 7.231683,
-        7.231683, 8.264781, 8.264781, 7.920415, 8.609147, 7.576049, 7.920415, 7.920415, 7.920415, 7.920415,
-        8.264781, 8.264781, 7.576049, 7.920415, 7.576049, 7.231683, 7.920415, 8.264781, 7.920415, 8.953512,
-        8.609147, 7.920415, 7.920415, 8.264781, 8.953512, 8.264781, 8.264781, 8.264781, 7.576049, 8.609147,
-        8.264781, 8.264781, 8.264781, 8.264781, 7.920415, 7.576049, 7.920415, 7.920415, 7.231683, 7.576049,
-        8.264781, 7.231683, 8.609147, 8.264781, 7.920415, 8.264781, 1.033098, 0.688732
-    };
-    
-    leftPerturbForce = {
-        -7.231683, -7.920415, -7.576049, -7.920415, -7.576049, -7.920415, -7.920415, -7.920415, -8.264781, -7.920415,
-        -8.264781, -8.264781, -8.264781, -8.264781, -7.920415, -7.920415, -7.920415, -8.264781, -7.920415, -7.576049,
-        -7.920415, -7.920415, -7.576049, -6.887317, -7.576049, -8.264781, -7.231683, -7.920415, -7.920415, -7.920415,
-        -7.576049, -8.953512, -8.264781, -7.920415, -7.920415, -7.576049, -7.231683, -7.576049, -7.920415, -7.920415,
-        -7.231683, -8.264781, -7.920415, -8.953512, -8.264781, -8.609147, -8.264781, -8.264781, -8.609147, -8.264781,
-        -7.920415, -8.264781, -8.264781, -8.609147, -8.264781, -7.231683, -7.231683, -7.576049, -7.920415, -7.920415,
-        -8.264781, -8.264781, -7.231683, -7.576049, -7.920415, -8.264781, -7.920415, -7.231683, -8.264781, -8.609147,
-        -7.576049, -8.264781, -8.264781, -7.920415, -8.264781, -8.609147, -8.609147, -8.264781, -7.920415, -8.264781,
-        -8.264781, -8.264781, -8.264781, -7.920415, -7.920415, -7.920415, -8.264781, -8.264781, -8.264781, -7.920415,
-        -8.609147, -8.264781, -8.264781, -8.264781, -8.264781, -8.609147, -7.576049, -8.264781, -8.264781, -8.264781,
-        -8.264781, -7.920415, -7.920415, -7.920415, -7.920415, -7.576049, -8.609147, -8.264781, -8.609147, -7.920415,
-        -8.953512, -7.920415, -8.264781, -7.920415, -8.264781, -8.609147, -8.609147, -8.609147, -8.264781, -8.953512,
-        -8.264781, -8.264781, -8.264781, -8.953512, -8.264781, -8.264781, -8.264781, -8.953512, -8.953512, -8.953512,
-        -8.264781, -8.264781, -8.609147, -8.264781, -8.264781, -8.609147, -7.920415, -7.576049, -7.920415, -8.264781,
-        -8.264781, -8.264781, -8.264781, -8.609147, -8.609147, -7.920415, -7.920415, -8.264781, -8.264781, -7.920415,
-        -8.609147, -8.609147, -8.609147, -8.264781, -7.920415, -8.609147, -8.264781, -8.264781, -8.609147, -8.264781,
-        -8.264781, -7.576049, -7.920415, -8.609147, -8.609147, -8.609147, -8.264781, -7.576049, -7.920415, -8.953512,
-        -8.264781, -7.920415, -7.920415, -7.920415, -8.609147, -7.920415, -8.264781, -8.264781, -7.920415, -8.609147,
-        -8.609147, -8.609147, -8.264781, -8.264781, -8.264781, -8.609147, -7.920415, -8.953512, -8.264781, -8.609147,
-        -8.609147, -8.264781, -8.953512, -8.264781, -8.264781, -7.920415, -7.920415, -8.609147, -9.297878, -8.264781,
-        -8.264781, -7.920415, -8.264781, -8.264781, -8.609147, -7.576049, -8.264781, -7.576049, -8.609147, -7.920415,
-        -8.264781, -8.264781, -8.264781, -8.609147, -8.264781, -8.264781, -9.98661, -8.264781, -7.920415, -7.920415,
-        -7.920415, -8.264781, -7.920415, -8.609147, -8.264781, -7.576049, -7.920415, -7.920415, -7.576049, -8.264781,
-        -8.609147, -8.609147, -8.609147, -8.609147, -8.609147, -8.264781, -8.264781, -8.609147, -7.920415, -8.609147,
-        -8.264781, -8.609147, -8.264781, -8.609147, -8.264781, -8.953512, -8.264781, -8.264781, -8.609147, -8.264781,
-        -7.576049, -9.297878, -8.264781, -8.609147, -7.920415, -8.953512, -8.264781, -8.609147, -8.953512, -8.609147,
-        -7.920415, -8.609147, -8.264781, -8.609147, -8.264781, -8.264781, -8.264781, -8.609147, -8.609147, -8.264781,
-        -8.264781, -8.264781, -7.920415, -7.576049, -8.264781, -8.609147, -8.953512, -8.264781, -8.264781, -7.920415,
-        -8.609147, -8.264781, -8.264781, -8.264781, -8.264781, -8.264781, -7.920415, -7.920415, -9.297878, -8.264781,
-        -8.264781, -8.264781, -8.609147, -8.609147, -8.609147, -8.264781, -8.264781, -8.264781, -8.264781, -8.264781,
-        -8.264781, -7.576049, -8.264781, -8.264781, -8.264781, -8.609147, -8.264781, -7.920415, -7.920415, -8.264781,
-        -7.920415, -8.264781, -8.264781, -8.609147, -8.264781, -7.920415, -8.264781, -8.264781, -8.609147, -8.264781,
-        -8.953512, -8.609147, -7.920415, -8.264781, -8.264781, -8.609147, -8.264781, -8.609147, -8.264781, -8.264781,
-        -8.264781, -8.264781, -8.953512, -7.920415, -8.609147, -8.264781, -7.920415, -8.953512, -8.264781, -7.920415,
-        -7.920415, -8.264781, -8.609147, -8.953512, -8.609147, -8.953512, -8.609147, -7.920415, -8.609147, -8.609147,
-        -8.264781, -8.953512, -8.609147, -8.609147, -8.264781, -8.609147, -8.264781, -8.953512, -7.231683, -7.576049,
-        -7.920415, -7.920415, -8.264781, -8.264781, -8.609147, -7.920415, -8.264781, -7.920415, -8.953512, -7.920415,
-        -8.264781, -8.264781, -7.576049, -8.609147, -8.264781, -8.264781, -8.264781, -7.576049, -8.264781, -8.609147,
-        -8.264781, -8.264781, -8.264781, -8.609147, -7.920415, -8.609147, -8.609147, -8.264781, -8.264781, -8.264781,
-        -8.264781, -8.609147, -8.264781, -7.920415, -7.920415, -8.264781, -7.576049, -8.609147, -8.264781, -8.953512,
-        -7.920415, -8.264781, -8.609147, -8.264781, -8.264781, -8.953512, -8.609147, -7.920415, -8.609147, -7.920415,
-        -8.264781, -8.264781, -8.609147, -8.264781, -7.920415, -7.920415, -7.576049, -7.231683, -7.576049, -7.920415,
-        -8.953512, -8.609147, -8.264781, -7.576049, -7.920415, -7.920415, -8.264781, -7.920415, -7.920415, -7.920415,
-        -7.920415, -8.264781, -8.609147, -8.264781, -7.576049, -7.576049, -7.920415, -8.264781, -8.264781, -8.264781,
-        -8.264781, -7.920415, -7.920415, -7.920415, -7.576049, -7.576049, -7.920415, -8.609147, -7.576049, -8.264781,
-        -7.576049, -6.887317, -8.264781, -8.609147, -7.920415, -7.576049, -7.576049, -7.920415, -7.920415, -7.920415,
-        -8.264781, -7.920415, -7.576049, -7.576049, -7.576049, -7.920415, -8.264781, -8.264781, -7.920415, -7.576049,
-        -7.920415, -8.264781, -7.920415, -8.264781, -7.576049, -7.231683, -7.920415, -7.920415, -8.264781, -8.264781,
-        -7.576049, -7.920415, -8.264781, -7.920415, -8.264781, -7.920415, -7.920415, -7.920415, -8.264781, -7.920415,
-        -7.920415, -7.576049, -7.576049, -7.576049, -7.920415, -7.231683, -7.576049, -8.609147, -7.576049, -8.264781,
-        -7.576049, -7.920415, -8.264781, -7.576049, -6.887317, -7.231683, -7.920415, -8.264781, -8.609147, -8.264781,
-        -7.576049, -7.576049, -8.264781, -8.264781, -8.953512, -8.264781, -7.920415, -8.264781, -7.920415, -8.264781,
-        -8.264781, -7.231683, -7.920415, -7.576049, -7.920415, -8.264781, -7.920415, -8.264781, -7.920415, -7.920415,
-        -7.920415, -8.264781, -8.264781, -7.920415, -7.920415, -1.033098
-    };*/
+
 
     spdlog::info("[STATIC] Loaded {} up and {} left perturbation samples (hard-coded).", upPerturbForce.size(), leftPerturbForce.size());
 }

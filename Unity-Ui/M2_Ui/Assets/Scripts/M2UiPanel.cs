@@ -4,12 +4,22 @@ using TMPro;
 using UnityEngine.UI;
 using System;
 using System.Collections;
+using System.Collections.Generic;
 
 namespace CORC.Demo
 {
     public class M2UiPanel : MonoBehaviour
     {
         [Header("Refs")]
+        [Header("End Marker Controller")]
+        public EndMarkerController endMarker;   // drag your EndMarkerController here (the singleton X sprite)
+        [Tooltip("Turn ON during training to show end position markers (X). Turn OFF in formal experiments.")]
+        public bool enableEndMarkers = true;
+        public Toggle endMarkerToggle;        // optional UI toggle to control enableEndMarkers
+        public GameObject xMarkPrefab;        // prefab of the red X marker (Sprite/World or UI)
+        public Transform markerParent;        // parent transform to hold spawned markers (e.g., world canvas or a container)
+        public float markerSize = 0.05f;      // optional: used if your prefab reads this size
+        private readonly List<GameObject> spawnedMarkers = new List<GameObject>(); // track spawned Xs so we can clear
         [Header("Participant ID")]
          public TMP_InputField participantIdIF;   // 输入受试者ID（数字）
         public Button applySIDBtn;               // 发送到下位机（S_SID）
@@ -30,13 +40,19 @@ namespace CORC.Demo
         public AudioClip beepClip;          // Optional: specific clip. If null, will call audioSource.Play()
         [Tooltip("Delay seconds for the beep module.")]
         public float beepDelaySeconds = 1f; // default 1s
-
+        // 在 [Header("Probability Control")] 下面添加
+        [Tooltip("Probability label on the monitor (Display 2). Optional.")]
+        public TMP_Text probLeftLabelMonitor;
         [Header("Beep Controls")]
         public Button beepAfterDelayBtn;    // optional UI button to trigger the 1s beep
         [Header("Session Rest")]
         [Tooltip("Seconds to rest after each session ends.")]
         public int restSeconds = 60;
         private bool isResting = false;
+        // 按下 Finish 后，屏蔽下一次 SESS 引发的休息倒计时
+        private bool suppressRestOnce = false;
+        // 如果需要可以记录协程句柄，方便中途取消
+        private Coroutine restCountdownCo = null;
 
         [Header("Visual Effects")]
         public ParticleSystem windEffectLeft;
@@ -80,6 +96,9 @@ namespace CORC.Demo
         private bool autoRunning = false;         // 是否正在自动化
         private bool stopAutoRequested = false;   // 请求停止标记
         private bool lastTrialEnded = false;      // 上一次 trial 是否刚刚结束（接收到 TREN）
+        // Tracks most recent max-trials setting (from S_MT or auto session)
+        // Tracks most recent max-trials setting (from S_MT or auto session)
+        private int lastMaxTrials = 0;
         public void OnStartExperimentClick()
         {
             if (proxy != null && proxy.IsReady)
@@ -128,7 +147,8 @@ namespace CORC.Demo
                 countdownText.text = string.Empty;
                 countdownText.gameObject.SetActive(false);
             }
-            isResting = false; // 仅防止重复开启
+            isResting = false; 
+            restCountdownCo = null;
         }
         private IEnumerator BeepAfterDelay(float seconds)
         {
@@ -163,7 +183,7 @@ namespace CORC.Demo
             }
 
             if (countdownText) countdownText.text = "GO!";
-            // 发送 STRT（只发一次）
+            yield return new WaitForSeconds(0.4f);// 发送 STRT（只发一次）
             proxy.SendCmd("STRT");
             Debug.Log("[UI] Sent: STRT (after countdown)");
             yield return new WaitForSeconds(0.2f);
@@ -175,47 +195,65 @@ namespace CORC.Demo
             }
             isCountingDown = false;
         }
+        private void DrawEndMarker(double endX, double endY)
+        {
+            if (!enableEndMarkers) return;
+            if (!xMarkPrefab) { Debug.LogWarning("[UI] xMarkPrefab not assigned; skip DrawEndMarker"); return; }
+
+            // World-space marker by default. If you're using UI Canvas, convert here as needed.
+            var pos = new Vector3((float)endX, (float)endY, 0f);
+            var go = Instantiate(xMarkPrefab, pos, Quaternion.identity, markerParent);
+            // Optional: apply size if your prefab supports it (e.g., via a component or scale)
+            if (markerSize > 0f) go.transform.localScale = Vector3.one * markerSize;
+            spawnedMarkers.Add(go);
+        }
+
+        private void ClearEndMarkers()
+        {
+            for (int i = 0; i < spawnedMarkers.Count; i++)
+            {
+                if (spawnedMarkers[i]) Destroy(spawnedMarkers[i]);
+            }
+            spawnedMarkers.Clear();
+        }
         private IEnumerator AutoSessionRoutine()
         {
             if (proxy == null || !proxy.IsReady) yield break;
             autoRunning = true;
             if (statusTxt) statusTxt.text = "Auto session started";
 
-            // 可选：把最大试次数设置为 trialsPerGroup * numGroups，避免早停
-            int totalTrials = Mathf.Max(1, trialsPerGroup * numGroups);
-            proxy.SendCmd("S_MT", new double[] { totalTrials });
-
+            
             for (int g = 1; g <= numGroups && !stopAutoRequested; g++)
             {
-                if (statusTxt) statusTxt.text = $"Group {g}/{numGroups}";
+                
 
                 for (int t = 1; t <= trialsPerGroup && !stopAutoRequested; t++)
                 {
-                    // 倒计时 3-2-1（可复用已有 UI）
+                    
                     yield return StartCoroutine(CountdownAndStartTrial(Mathf.RoundToInt(preTrialCountdown)));
 
-                    // 等待机器人发回 TREN（试次结束）
+                    
                     lastTrialEnded = false;
-                    float safetyTimeout = 10f; // 防御：若 trial 没有结束信号，最多等 10s
+                    float safetyTimeout = 10f; 
                     float waited = 0f;
                     while (!lastTrialEnded && !stopAutoRequested && waited < safetyTimeout)
                     {
-                        yield return null; // 等下一帧，Update() 会把 TREN -> lastTrialEnded = true
+                        yield return null; 
                         waited += Time.deltaTime;
                     }
 
-                    // 停 5 秒
+                    
                     if (restBetweenTrials > 0)
                         yield return new WaitForSeconds(restBetweenTrials);
 
-                    // 回到 A：发 RSTA，等待若干秒（稳定时间）
+                    
                     proxy.SendCmd("RSTA");
                     if (settleAfterRsta > 0)
                         yield return new WaitForSeconds(settleAfterRsta);
                 }
             }
 
-            // 自动化完成：发送 HALT 结束 session
+            
             proxy.SendCmd("HALT");
             if (statusTxt) statusTxt.text = "Auto session finished";
             autoRunning = false;
@@ -235,6 +273,22 @@ namespace CORC.Demo
         }
         public void OnFinishClick()
         {
+            // 屏蔽下一次休息倒计时
+            suppressRestOnce = true;
+
+            // 如有正在进行的休息倒计时，立刻停止并收起 UI
+            if (restCountdownCo != null)
+            {
+                StopCoroutine(restCountdownCo);
+                restCountdownCo = null;
+            }
+            isResting = false;
+            if (countdownText)
+            {
+                countdownText.text = string.Empty;
+                countdownText.gameObject.SetActive(false);
+            }
+
             if (proxy != null && proxy.IsReady)
             {
                 proxy.SendCmd("HALT");
@@ -284,6 +338,7 @@ namespace CORC.Demo
                 {
                     double val = Math.Max(1, (int)Math.Round(targ));
                     proxy.SendCmd("S_TS", new double[] { val });
+                    
                     Debug.Log($"[UI] Sent 'S_TS' with value: {val}");
                 }
             }
@@ -293,6 +348,7 @@ namespace CORC.Demo
                 if (TryParse(maxTrialsIF.text, out var mt, 20))
                 {
                     double val = Math.Max(1, (int)Math.Round(mt));
+                    lastMaxTrials = (int)val;
                     proxy.SendCmd("S_MT", new double[] { val });
                     Debug.Log($"[UI] Sent 'S_MT' with value: {val}");
                 }
@@ -307,7 +363,9 @@ namespace CORC.Demo
             proxy.SendCmd("S_PB", new double[] { Mathf.Clamp01((float)p) });
             Debug.Log($"[UI] Sent 'S_PB' with value: {p:F3}");
             if (probLeftLabel) probLeftLabel.text = $"pLeft: {p:F2}";
+            if (probLeftLabelMonitor) probLeftLabelMonitor.text = $"{(p * 100f):F0}%";
         }
+        
         public void OnBeepAfterDelayClick()
         {
             StartCoroutine(BeepAfterDelay(beepDelaySeconds));
@@ -331,6 +389,25 @@ namespace CORC.Demo
             if (autoStopBtn) autoStopBtn.onClick.AddListener(OnAutoStopClicked);
             if (trialDurTxt) trialDurTxt.text = string.Empty;
             if (applySIDBtn) applySIDBtn.onClick.AddListener(OnApplySIDClick);
+            if (endMarkerToggle)
+            {
+                // Initialize toggle UI from panel flag
+                endMarkerToggle.isOn = enableEndMarkers;
+
+                // Also propagate to EndMarkerController at startup
+                if (endMarker) endMarker.SetEnabled(enableEndMarkers);
+
+                endMarkerToggle.onValueChanged.AddListener(v =>
+                {
+                    enableEndMarkers = v;
+                    // Route to EndMarkerController so the singleton X shows/hides immediately
+                    if (endMarker) endMarker.SetEnabled(v);
+                    else if (!v) ClearEndMarkers(); // legacy (prefab mode) fallback
+                });
+            }
+
+            // If endMarker not assigned in Inspector, try to find one in the scene (sane default)
+            if (!endMarker) endMarker = FindObjectOfType<EndMarkerController>();
         }
 
         void Update()
@@ -354,18 +431,16 @@ namespace CORC.Demo
             if (probLeftLabel && probLeftSlider)
                 probLeftLabel.text = $"pLeft: {probLeftSlider.value:F2}";
             var cmds = proxy.DrainCmds();
+
             foreach (var c in cmds)
             {
+
                 string cmd = (c.cmd ?? string.Empty).TrimEnd('\0');
                 var p = c.parameters ?? Array.Empty<double>();
                 Debug.Log($"[UI Received] {cmd} ({p.Length} params)");
 
-                if (cmd == "ECHO")
-                {
-                    // 回声核对
-                    Debug.Log("[UI] ECHO from M2");
-                }
-                else if (cmd == "TRBG")
+
+                if (cmd == "TRBG")
                 {
                     // params: t, dirCode, pLeft, mode, cur, max
                     int mode = (p.Length > 3) ? (int)p[3] : 0;
@@ -385,42 +460,44 @@ namespace CORC.Demo
                         statusTxt.text = $"Trial End! Score: {trialScore:F1}";
                     }
 
-                    if (scoreTxt && p.Length >= 9)
+                    if (scoreTxt)
                     {
-                        int cur = (int)p[7];
-                        int max = (int)p[8];
+                        // 协议：cur在 p[7]，max 在 p[8]；不足时用 lastMaxTrials 兜底
+                        int cur = (p.Length > 7) ? (int)p[7] : 0;
+                        int maxTrials = (p.Length > 8) ? (int)p[8] : lastMaxTrials;
+
                         if (mode == 1) // V1
                         {
                             int v1_suc = (p.Length > 9) ? (int)p[9] : 0;
                             scoreTxt.text = $"V1: Successes {v1_suc} | Trials {cur}";
+
+                            // V1 不显示 effort / distance
+                            if (trialEffortTxt) trialEffortTxt.text = string.Empty;
+                            if (trialDistTxt) trialDistTxt.text = string.Empty;
                         }
                         else if (mode == 2) // V2
                         {
-                            double v2_sco = (p.Length > 12) ? p[12] : 0.0;
-                            scoreTxt.text = $"V2: {cur}/{max} | Score {trialScore:F1} | Total {v2_sco:F1}";
-                            // Indices: t(0), dur(1), reached(2), dist(3), effort(4), trialScore(5)
+                            double v2_total = (p.Length > 12) ? p[12] : 0.0;
+                            scoreTxt.text = $"V2: {cur}/{(maxTrials > 0 ? maxTrials : cur)} | Score {trialScore:F1}";
 
-
+                            // V2 显示 effort / distance
+                            double effort = (p.Length > 4) ? p[4] : 0.0;
+                            double dist = (p.Length > 3) ? p[3] : 0.0;
+                            if (trialEffortTxt) trialEffortTxt.text = $"Effort: {effort:F3}";
+                            if (trialDistTxt) trialDistTxt.text = $"Distance: {dist:F3}";
                         }
-                        double effort = (p.Length > 4) ? p[4] : 0.0;
-                        double dist = (p.Length > 3) ? p[3] : 0.0;
-                        double dur = (p.Length > 1) ? p[1] : 0.0;
-
-                        if (trialEffortTxt) trialEffortTxt.text = $"Effort: {effort:F3}";
-                        if (trialDistTxt) trialDistTxt.text = $"Distance: {dist:F3}";
-
-
-                        // Only show duration-to-reach if reached==1 (没超时才显示到达用时)
-                        if (trialDurTxt)
-                        {
-                            if (reached == 1)
-                                trialDurTxt.text = $"Time-to-reach: {dur:F3} s";
-                            else
-                                trialDurTxt.text = "Time-to-reach: — (timeout)";
-                        }        // --- Per-trial metrics display (Effort, Distance, Score, Duration-to-reach) ---
-
                     }
-                                    
+
+                    // Time-to-reach：只在到达时显示
+                    if (trialDurTxt)
+                    {
+                        double dur = (p.Length > 1) ? p[1] : 0.0;
+                        if (reached == 1)
+                            trialDurTxt.text = $"Time-to-reach: {dur:F3} s";
+                        else
+                            trialDurTxt.text = "Time-to-reach: — (timeout)";
+                    }
+
                     lastTrialEnded = true;
                 }
                 else if (cmd == "SESS")
@@ -435,13 +512,56 @@ namespace CORC.Demo
                         else if (mode == 2)
                             scoreTxt.text = $"Final V2: Total {(p.Length > 3 ? p[3] : 0.0):F1} | Trials {(p.Length > 4 ? (int)p[4] : 0)}";
                     }
-                    // 在 SESS 分支末尾添加：
-                    if (!isResting && restSeconds > 0)
+
+                    if (!suppressRestOnce && !isResting && restSeconds > 0)
                     {
-                        StartCoroutine(SessionRestCountdown(restSeconds));
+
+                        restCountdownCo = StartCoroutine(SessionRestCountdown(restSeconds));
                     }
-                    autoRunning = false; // 自动化结束
-                    stopAutoRequested = true; // 确保停止标记
+                    else
+                    {
+
+                        if (suppressRestOnce)
+                        {
+                            suppressRestOnce = false;
+                            if (countdownText)
+                            {
+                                countdownText.text = string.Empty;
+                                countdownText.gameObject.SetActive(false);
+                            }
+                        }
+                    }
+                    autoRunning = false;
+                    stopAutoRequested = true;
+                    if (!enableEndMarkers)
+                    {
+                        if (endMarker) endMarker.HideAll();
+                        else ClearEndMarkers();
+                    }
+
+                }
+                else if (cmd == "TRPS")
+                {
+                    if (p.Length >= 5)
+                    {
+                        int    trialIdx   = (int)p[0];
+                        double endX       = p[1];
+                        double endY       = p[2];
+                        double distToGoal = p[3];
+                        bool   isTimeout  = (p[4] > 0.5);
+
+                        Debug.Log($"[UI] TRPS trial={trialIdx} end=({endX:F3},{endY:F3}) dist={distToGoal:F3} timeout={isTimeout}");
+
+                        // Only draw when enabled
+                            // Prefer EndMarkerController singleton; fallback to legacy prefab mode if not present
+                        if (endMarker && endMarker.enableEndMarkers) endMarker.ShowAtRobot(endX, endY);
+                        else if (enableEndMarkers) DrawEndMarker(endX, endY);
+                    }
+                    else
+                    {
+                        Debug.LogWarning($"[UI] TRPS: insufficient params (got {p.Length}, need 5)");
+                    }
+                    
                 }
             }
 
